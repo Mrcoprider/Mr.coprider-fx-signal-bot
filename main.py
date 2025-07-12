@@ -6,9 +6,9 @@ from datetime import datetime
 
 app = Flask(__name__)
 
-# === Your NEW Bot Token and Chat ID ===
+# === Telegram Bot Configuration ===
 BOT_TOKEN = "7542580180:AAFTa-QVS344MgPlsnvkYRZeenZ-RINvOoc"
-CHAT_ID = "-1002123269500"  # Mr. Coprider FX Channel (must be admin!)
+CHAT_ID = "-1002507284584"  # ✅ NEW Telegram Channel/Group ID
 
 # === Pips configuration ===
 pip_size = 0.10  # 1 pip in XAUUSD = 0.10
@@ -36,8 +36,7 @@ def send_telegram(text):
         "text": text,
         "parse_mode": "Markdown"
     }
-    response = requests.post(url, json=payload)
-    print("Telegram response:", response.text)
+    requests.post(url, json=payload)
 
 def log_to_csv(symbol, entry, direction, hit_pips):
     time_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -60,6 +59,9 @@ def index():
 
     symbol = data.get("symbol")
     price = data.get("entry") or data.get("price")
+    direction = data.get("direction", "Buy")
+    sl = data.get("sl")
+    tp = data.get("tp")
 
     if not symbol or not price:
         return jsonify({"error": "Missing symbol or price"}), 400
@@ -69,14 +71,19 @@ def index():
     signals = load_signals()
 
     if symbol not in signals:
-        direction = data.get("direction", "Buy")
         signals[symbol] = {
             "entry": price,
             "direction": direction,
             **{f"hit_{p}": False for p in pip_targets}
         }
         save_signals(signals)
-        send_telegram(f"📤 *New Trade Entry:* {symbol} {direction}\n🎯 Entry: `{price}`")
+
+        # Format message
+        msg = f"📤 *New Trade Entry:* {symbol} {direction}\n🎯 Entry: `{price}`"
+        if sl and tp:
+            msg += f"\n🛑 SL: `{sl}`\n🎯 TP: `{tp}`"
+        send_telegram(msg)
+
         return jsonify({"message": "New entry saved"}), 200
 
     entry = float(signals[symbol]["entry"])
