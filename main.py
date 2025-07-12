@@ -6,9 +6,9 @@ from datetime import datetime
 
 app = Flask(__name__)
 
-# === Your Bot Token and Chat ID ===
-BOT_TOKEN = "6800939312:AAEaGv0WqfEOWo0BoPPR1vnYHP0J1cZLFCM"
-CHAT_ID = "-1002123269500"  # Mr. Coprider FX Channel
+# === Your NEW Bot Token and Chat ID ===
+BOT_TOKEN = "7542580180:AAFTa-QVS344MgPlsnvkYRZeenZ-RINvOoc"
+CHAT_ID = "-1002123269500"  # Mr. Coprider FX Channel (must be admin!)
 
 # === Pips configuration ===
 pip_size = 0.10  # 1 pip in XAUUSD = 0.10
@@ -36,14 +36,8 @@ def send_telegram(text):
         "text": text,
         "parse_mode": "Markdown"
     }
-    try:
-        response = requests.post(url, json=payload)
-        if response.status_code != 200:
-            print(f"⚠️ Telegram Error: {response.status_code} {response.text}")
-        else:
-            print("✅ Telegram message sent.")
-    except Exception as e:
-        print(f"❌ Failed to send Telegram message: {e}")
+    response = requests.post(url, json=payload)
+    print("Telegram response:", response.text)
 
 def log_to_csv(symbol, entry, direction, hit_pips):
     time_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -62,16 +56,12 @@ def index():
 
     data = request.get_json()
     if not data:
-        print("❌ No data received")
         return jsonify({"error": "No data received"}), 400
-
-    print("✅ Webhook received:", data)
 
     symbol = data.get("symbol")
     price = data.get("entry") or data.get("price")
 
     if not symbol or not price:
-        print("❌ Missing symbol or price in data")
         return jsonify({"error": "Missing symbol or price"}), 400
 
     symbol = symbol.upper()
@@ -86,7 +76,6 @@ def index():
             **{f"hit_{p}": False for p in pip_targets}
         }
         save_signals(signals)
-        print(f"📥 New trade saved: {symbol} {direction} at {price}")
         send_telegram(f"📤 *New Trade Entry:* {symbol} {direction}\n🎯 Entry: `{price}`")
         return jsonify({"message": "New entry saved"}), 200
 
@@ -102,15 +91,12 @@ def index():
 
     if hit_pips:
         for p in hit_pips:
-            msg = f"🎯 *{symbol}* hit `{p}` pips ✅\n📈 From: `{entry}` → Now: `{price}`"
-            send_telegram(msg)
+            send_telegram(f"🎯 *{symbol}* hit `{p}` pips ✅\n📈 From: `{entry}` → Now: `{price}`")
             log_to_csv(symbol, entry, direction, p)
 
         save_signals(signals)
-        print(f"✅ Pips hit: {hit_pips}")
         return jsonify({"message": f"Pips hit: {hit_pips}"}), 200
 
-    print("ℹ️ No pip target hit yet.")
     return jsonify({"message": "No pip target hit"}), 200
 
 # === Run App ===
