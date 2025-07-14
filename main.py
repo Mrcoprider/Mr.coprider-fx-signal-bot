@@ -261,6 +261,8 @@ def migrate_add_message_id():
         return "✅ Migration successful: `message_id` column added."
     except Exception as e:
         return f"⚠️ Migration error: {str(e)}"
+        init_db()
+ensure_message_id_column()
 
 # === MAIN ===
 if __name__ == "__main__":
