@@ -172,3 +172,13 @@ def poll_prices():
 # === MAIN ===
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
+
+    
+    from flask import send_file
+
+@app.route("/download-db", methods=["GET"])
+def download_db():
+    try:
+        return send_file(DB_FILE, as_attachment=True)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
