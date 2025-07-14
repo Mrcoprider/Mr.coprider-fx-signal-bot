@@ -77,6 +77,24 @@ def send_telegram(message):
         "parse_mode": "Markdown"
     }
     requests.post(url, json=payload)
+    import random
+
+def fetch_live_price(symbol):
+    """
+    Mock live price fetcher. Replace with real broker/API later.
+    Adds small random variation to simulate price movement.
+    """
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT entry FROM trades WHERE symbol = ? ORDER BY id DESC LIMIT 1", (symbol,))
+    result = c.fetchone()
+    conn.close()
+
+    if result:
+        base = result[0]
+        variation = random.uniform(-0.005, 0.005)  # Simulate slight price change
+        return round(base + variation, 5)
+    return 0
 
 # === SIGNAL POSTING ROUTE ===
 @app.route("/", methods=["POST"])
@@ -130,7 +148,7 @@ def poll_prices():
     for row in rows:
         trade_id, symbol, direction, entry, sl, tp, tf, note, timestamp, status, pips_hit = row
 
-        current_price = entry  # Placeholder for live price
+        current_price = fetch_live_price(symbol)
 
         pip_gain = calc_pips(symbol, entry, current_price)
         closed = False
