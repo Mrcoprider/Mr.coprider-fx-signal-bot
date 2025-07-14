@@ -1,138 +1,141 @@
-import json
-import sqlite3
+from flask import Flask, request, jsonify
+import requests
+import csv
 from datetime import datetime
 import pytz
-import requests
-from flask import Flask, request
 
 app = Flask(__name__)
 
-# === CONFIG ===
+# ==== Telegram Config ====
 BOT_TOKEN = "7542580180:AAFTa-QVS344MgPlsnvkYRZeenZ-RINvOoc"
 CHAT_ID = "-1002507284584"
-DB_PATH = "signals.db"
+TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-# === DATABASE SETUP ===
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS signals (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    symbol TEXT,
-                    direction TEXT,
-                    entry REAL,
-                    sl REAL,
-                    tp REAL,
-                    note TEXT,
-                    timeframe TEXT,
-                    timestamp TEXT,
-                    telegram_message_id TEXT,
-                    status TEXT
-                )''')
-    conn.commit()
-    conn.close()
-
-# === PIP SIZE MAP ===
+# ==== Symbol PIP Rounding Map ====
 pip_map = {
-    "XAUUSD": 0.1,
-    "XAGUSD": 0.01,
-    "US30": 1,
-    "NAS100": 1,
-    "SPX500": 0.1,
-    "GER30": 1,
-    "UK100": 1,
-    "USDJPY": 0.01,
-    "JPY": 0.01,
-    "BTCUSD": 1,
-    "ETHUSD": 0.01,
-    "DXY": 0.01
+    "XAUUSD": 2, "XAGUSD": 3, "WTICOUSD": 2,
+    "BTCUSD": 2, "ETHUSD": 2, "US30": 0,
+    "NAS100": 0, "SPX500": 1, "DXY": 2,
+    "EURUSD": 5, "GBPUSD": 5, "USDJPY": 3,
+    "USDCHF": 4, "AUDUSD": 5, "USDCAD": 5,
+    "NZDUSD": 5
 }
-default_pip_size = 0.0001
+default_round = 2
 
-# === FORMAT TIMEFRAME ===
+# ==== Timeframe Format Map ====
+tf_map = {
+    "1": "1M", "3": "3M", "5": "5M", "15": "15M", "30": "30M",
+    "60": "H1", "120": "H2", "180": "H3", "240": "H4",
+    "D": "Daily", "W": "Weekly", "M": "Monthly"
+}
+
+# ==== Message ID Tracker ====
+message_map = {}
+
+# ==== CSV Logger ====
+csv_file = "signal_logs.csv"
+csv_headers = ["symbol", "direction", "entry", "sl", "tp", "timestamp", "pips_hit"]
+
+def format_time_ist(timestamp):
+    utc_time = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
+    utc_time = pytz.utc.localize(utc_time)
+    ist_time = utc_time.astimezone(pytz.timezone("Asia/Kolkata"))
+    return ist_time.strftime("%d-%b-%Y %I:%M %p")
+
 def format_timeframe(tf):
-    tf_map = {
-        "1": "1M", "3": "3M", "5": "5M", "15": "15M",
-        "30": "30M", "60": "H1", "120": "H2", "180": "H3", "240": "H4",
-        "D": "Daily", "W": "Weekly"
-    }
     return tf_map.get(tf, tf + "M")
 
-# === CONVERT TO IST ===
-def convert_to_ist(utc_string):
-    utc_time = datetime.strptime(utc_string, "%Y-%m-%d %H:%M:%S")
-    utc = pytz.utc
-    ist = pytz.timezone("Asia/Kolkata")
-    local_time = utc.localize(utc_time).astimezone(ist)
-    return local_time.strftime("%d-%b-%Y %I:%M %p")
+def get_round(symbol):
+    return pip_map.get(symbol.upper(), default_round)
 
-# === ROUND LEVELS ===
-def round_level(symbol, price):
-    pip_size = pip_map.get(symbol, default_pip_size)
-    precision = abs(int(round(-1 * (pip_size).as_integer_ratio()[1]).bit_length() / 3))  # rough estimator
-    return round(price, precision if pip_size < 1 else 2)
-
-# === TELEGRAM SEND ===
-def send_telegram_message(text):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+def send_telegram_message(text, reply_to=None):
     payload = {
         "chat_id": CHAT_ID,
         "text": text,
         "parse_mode": "Markdown"
     }
-    r = requests.post(url, json=payload)
-    if r.status_code == 200:
-        return r.json()["result"]["message_id"]
+    if reply_to:
+        payload["reply_to_message_id"] = reply_to
+    response = requests.post(f"{TELEGRAM_API}/sendMessage", json=payload)
+    if response.ok:
+        return response.json().get("result", {}).get("message_id")
     return None
 
-# === TELEGRAM FOLLOW-UP ===
-def send_followup(symbol, direction, result, pips, original_note):
-    emoji = "🎯" if result == "TP HIT" else "🛑"
-    text = f"{emoji} *{symbol} | {direction}* {result}!\n🎯 Pips Gained: *{pips}*\n📝 {original_note}"
-    send_telegram_message(text)
+def log_to_csv(data, pips_hit="0"):
+    row = {
+        "symbol": data["symbol"],
+        "direction": data["direction"],
+        "entry": data["entry"],
+        "sl": data["sl"],
+        "tp": data["tp"],
+        "timestamp": data["timestamp"],
+        "pips_hit": pips_hit
+    }
+    write_headers = not os.path.exists(csv_file)
+    with open(csv_file, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=csv_headers)
+        if write_headers:
+            writer.writeheader()
+        writer.writerow(row)
 
-# === SIGNAL POST ===
 @app.route("/", methods=["POST"])
-def handle_signal():
-    data = request.get_json()
+def receive_signal():
+    data = request.json
+    if not data:
+        return jsonify({"error": "No data received"}), 400
+
+    symbol = data.get("symbol", "NA")
+    direction = data.get("direction", "").capitalize()
+    entry = round(float(data.get("entry", 0)), get_round(symbol))
+    sl = round(float(data.get("sl", 0)), get_round(symbol))
+    tp = round(float(data.get("tp", 0)), get_round(symbol))
+    timeframe = format_timeframe(str(data.get("timeframe", "")))
+    timestamp = format_time_ist(data.get("timestamp", ""))
+    note = data.get("note", "Mr.CopriderBot Signal")
+
+    emoji = "🟢" if direction == "Buy" else "🔴"
+
+    message = f"""
+📡 *Mr.Coprider Bot Signal*
+
+{emoji} *{symbol} | {direction.upper()}*
+*Timeframe:* {timeframe}
+*Entry:* {entry}
+*SL:* {sl}
+*TP:* {tp}
+🕐 {timestamp}
+📝 {note}
+""".strip()
+
+    # Send initial message and track ID
+    message_id = send_telegram_message(message)
+    message_map[symbol] = message_id
+
+    # Log the signal
+    log_to_csv(data)
+
+    return jsonify({"message": "Signal posted"})
+
+@app.route("/update", methods=["POST"])
+def update_signal():
+    data = request.json
+    if not data or "symbol" not in data:
+        return jsonify({"error": "Missing symbol"}), 400
 
     symbol = data["symbol"]
-    direction = data["direction"]
-    entry = round_level(symbol, float(data["entry"]))
-    sl = round_level(symbol, float(data["sl"]))
-    tp = round_level(symbol, float(data["tp"]))
-    note = data.get("note", "Mr.CopriderBot Signal")
-    timeframe = format_timeframe(data.get("timeframe", "15"))
-    timestamp = convert_to_ist(data["timestamp"])
+    pips = data.get("pips", 0)
+    status = data.get("status", "")  # e.g., "TP HIT", "SL HIT"
 
-    # Message formatting
-    emoji = "🟢" if direction.lower() == "buy" else "🔴"
-    message = (
-        f"📡 *Mr.Coprider Bot Signal*\n\n"
-        f"{emoji} *{symbol} | {direction.upper()}*\n"
-        f"Timeframe: *{timeframe}*\n"
-        f"Entry: *{entry}*\n"
-        f"SL: *{sl}*\n"
-        f"TP: *{tp}*\n"
-        f"🕐 {timestamp}\n"
-        f"📝 {note}"
-    )
+    update_msg = f"📢 *{symbol}* {status} ✅\n🎯 *Pips Gained:* {pips} pips"
+    reply_to = message_map.get(symbol)
 
-    msg_id = send_telegram_message(message)
+    if reply_to:
+        send_telegram_message(update_msg, reply_to=reply_to)
+        return jsonify({"message": "Follow-up posted"})
+    else:
+        return jsonify({"message": "Entry not found to reply"}), 404
 
-    # Log to DB
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('''INSERT INTO signals 
-                 (symbol, direction, entry, sl, tp, note, timeframe, timestamp, telegram_message_id, status)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-              (symbol, direction, entry, sl, tp, note, timeframe, timestamp, msg_id, "active"))
-    conn.commit()
-    conn.close()
-
-    return {"message": "Signal posted"}
-
-# === INIT ===
+# ==== Entry Point ====
 if __name__ == "__main__":
-    init_db()
+    import os
     app.run(host="0.0.0.0", port=8080)
