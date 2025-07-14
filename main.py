@@ -3,6 +3,8 @@ import sqlite3
 import requests
 from datetime import datetime
 import pytz
+import threading
+import time
 
 app = Flask(__name__)
 
@@ -10,6 +12,7 @@ app = Flask(__name__)
 BOT_TOKEN = "7542580180:AAFTa-QVS344MgPlsnvkYRZeenZ-RINvOoc"
 CHAT_ID = "-1002507284584"
 DB_FILE = "signals.db"
+POLL_INTERVAL = 15  # seconds
 
 # === DB INIT ===
 def init_db():
@@ -26,7 +29,8 @@ def init_db():
             timeframe TEXT,
             note TEXT,
             timestamp TEXT,
-            status TEXT DEFAULT 'open'
+            status TEXT DEFAULT 'open',
+            last_pip_hit INTEGER DEFAULT 0
         )
     ''')
     conn.commit()
@@ -37,18 +41,13 @@ init_db()
 # === FORMATTERS ===
 def format_tf(tf):
     tf = tf.upper()
-    if tf == "1": return "1M"
-    if tf == "3": return "3M"
-    if tf == "5": return "5M"
-    if tf == "15": return "15M"
-    if tf == "30": return "30M"
-    if tf in ["60", "1H", "H1"]: return "H1"
-    if tf in ["120", "2H", "H2"]: return "H2"
-    if tf in ["240", "4H", "H4"]: return "H4"
-    if tf in ["D", "1D"]: return "Daily"
-    if tf in ["W", "1W"]: return "Weekly"
-    if tf in ["M", "1M"]: return "Monthly"
-    return tf
+    tf_map = {
+        "1": "1M", "3": "3M", "5": "5M", "15": "15M", "30": "30M",
+        "60": "H1", "1H": "H1", "120": "H2", "2H": "H2",
+        "240": "H4", "4H": "H4", "D": "Daily", "1D": "Daily",
+        "W": "Weekly", "1W": "Weekly", "M": "Monthly", "1M": "Monthly"
+    }
+    return tf_map.get(tf, tf)
 
 def format_time_ist(timestamp):
     try:
@@ -64,6 +63,11 @@ def round_price(value, symbol):
         return round(value, 2)
     return round(value, 5)
 
+def pip_value(symbol):
+    if any(x in symbol for x in ["JPY", "XAU", "XAG", "BTC", "ETH", "US30", "NAS", "GER", "IND"]):
+        return 0.01
+    return 0.0001
+
 # === TELEGRAM ===
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -74,12 +78,61 @@ def send_telegram(message):
     }
     requests.post(url, json=payload)
 
+# === PRICE FETCHING ===
+def fetch_price(symbol):
+    try:
+        url = f"https://api.binance.com/api/v3/ticker/price?symbol={symbol.upper()}"
+        r = requests.get(url)
+        return float(r.json().get("price", 0))
+    except:
+        return None
+
+# === PIP TRACKER ===
+def background_poller():
+    while True:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT id, symbol, direction, entry, sl, tp, last_pip_hit FROM trades WHERE status = 'open'")
+        trades = c.fetchall()
+        for trade in trades:
+            id, symbol, direction, entry, sl, tp, last_hit = trade
+            price = fetch_price(symbol)
+            if price is None:
+                continue
+            pval = pip_value(symbol)
+            gain = (price - entry) if direction.lower() == "buy" else (entry - price)
+            pips = int(gain / pval)
+
+            milestones = [50, 100, 150, 200, 250, 300]
+            for m in milestones:
+                if last_hit < m <= pips:
+                    send_telegram(f"📈 *{symbol}* `{direction}` hit `{m} pips` ✅")
+                    c.execute("UPDATE
+                    c.execute("UPDATE trades SET last_pip_hit = ? WHERE id = ?", (m, id))
+
+            # SL/TP Trigger
+            if direction.lower() == "buy":
+                if price <= sl:
+                    send_telegram(f"🛑 *{symbol}* `BUY` Stop Loss hit at {round_price(price, symbol)} ❌")
+                    c.execute("UPDATE trades SET status = 'closed' WHERE id = ?", (id,))
+                elif price >= tp:
+                    send_telegram(f"🎯 *{symbol}* `BUY` Take Profit hit at {round_price(price, symbol)} ✅")
+                    c.execute("UPDATE trades SET status = 'closed' WHERE id = ?", (id,))
+            else:
+                if price >= sl:
+                    send_telegram(f"🛑 *{symbol}* `SELL` Stop Loss hit at {round_price(price, symbol)} ❌")
+                    c.execute("UPDATE trades SET status = 'closed' WHERE id = ?", (id,))
+                elif price <= tp:
+                    send_telegram(f"🎯 *{symbol}* `SELL` Take Profit hit at {round_price(price, symbol)} ✅")
+                    c.execute("UPDATE trades SET status = 'closed' WHERE id = ?", (id,))
+        conn.commit()
+        conn.close()
+        time.sleep(POLL_INTERVAL)
+
 # === ROUTE ===
 @app.route("/", methods=["POST"])
 def receive_signal():
     data = request.get_json()
-
-    # Parse and clean
     symbol = data.get("symbol", "").replace("{{ticker}}", "").strip().upper()
     raw_tf = data.get("timeframe", "").replace("{{interval}}", "").replace("{{INTERVAL}}", "").strip()
     tf = format_tf(raw_tf) if raw_tf else "N/A"
@@ -91,7 +144,6 @@ def receive_signal():
     timestamp_raw = data.get("timestamp", "")
     timestamp = format_time_ist(timestamp_raw)
 
-    # Store
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute('''
@@ -101,7 +153,6 @@ def receive_signal():
     conn.commit()
     conn.close()
 
-    # Message
     emoji = "🟢" if direction.lower() == "buy" else "🔴"
     message = f"""
 📡 Mr.Coprider Bot Signal
@@ -120,4 +171,5 @@ TP: {tp}
 
 # === MAIN ===
 if __name__ == "__main__":
+    threading.Thread(target=background_poller, daemon=True).start()
     app.run(host="0.0.0.0", port=8080)
