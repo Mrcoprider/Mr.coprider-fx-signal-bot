@@ -251,6 +251,9 @@ def show_trades():
     html += "</table></body></html>"
     return html
     @app.route("/migrate-add-message-id", methods=["GET"])
+    # === DB INIT ===
+def init_db():
+    ...
 def migrate_add_message_id():
     try:
         conn = sqlite3.connect(DB_FILE)
