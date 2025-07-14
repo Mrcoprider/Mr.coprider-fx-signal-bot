@@ -1,158 +1,78 @@
-from flask import Flask, request, jsonify
-import json
-import requests
-import os
-from datetime import datetime
+import json 
+import time import requests import sqlite3 from flask import Flask, request
 
-app = Flask(__name__)
+app = Flask(name)
 
-# === Bot Configuration ===
-BOT_TOKEN = "7542580180:AAFTa-QVS344MgPlsnvkYRZeenZ-RINvOoc"
-CHAT_ID = "-1002507284584"
+=== CONFIG ===
 
-# === Pip sizes for major instruments ===
-pip_sizes = {
-    # Major Forex Pairs
-    "EURUSD": 0.0001, "GBPUSD": 0.0001, "USDJPY": 0.01, "USDCHF": 0.0001,
-    "AUDUSD": 0.0001, "USDCAD": 0.0001, "NZDUSD": 0.0001, "EURJPY": 0.01,
-    "GBPJPY": 0.01, "CHFJPY": 0.01, "EURGBP": 0.0001, "AUDJPY": 0.01,
-    "CADJPY": 0.01,
-    # Metals
-    "XAUUSD": 0.10, "XAGUSD": 0.01, "XAUEUR": 0.10, "XPTUSD": 0.10, "XPDUSD": 0.10,
-    # Cryptos
-    "BTCUSD": 1.0, "ETHUSD": 0.1, "LTCUSD": 0.01, "BNBUSD": 0.1,
-    "XRPUSD": 0.0001, "DOGEUSD": 0.00001, "SOLUSD": 0.01,
-    "ADAUSD": 0.0001, "DOTUSD": 0.01, "AVAXUSD": 0.01,
-    # Dollar Index
-    "DXY": 0.01
-}
+BOT_TOKEN = "7542580180:AAFTa-QVS344MgPlsnvkYRZeenZ-RINvOoc" CHAT_ID = "-1002507284584" TELEGRAM_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage" DB_PATH = "signals.db"
 
-# === Pip milestones ===
-pip_targets = [50, 100, 150, 200, 250, 300]
+=== INIT DB ===
 
-# === Files ===
-signal_file = "signals.json"
-log_file = "signal_logs.csv"
+conn = sqlite3.connect(DB_PATH, check_same_thread=False) c = conn.cursor() c.execute('''CREATE TABLE IF NOT EXISTS trades ( id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT, direction TEXT, entry REAL, sl REAL, tp REAL, note TEXT, timeframe TEXT, timestamp TEXT, status TEXT DEFAULT 'open', message_id INTEGER )''') conn.commit()
 
-# === Utilities ===
-def load_signals():
-    if not os.path.exists(signal_file):
-        return {}
-    with open(signal_file, "r") as file:
-        return json.load(file)
+=== FORMATTERS ===
 
-def save_signals(data):
-    with open(signal_file, "w") as file:
-        json.dump(data, file, indent=2)
+def format_price(price): return f"{price:.2f}" if price >= 1 else f"{price:.5f}"
 
-def send_telegram(text):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": text,
-        "parse_mode": "Markdown"
-    }
-    requests.post(url, json=payload)
+def format_signal(data): symbol = data['symbol'] direction = data['direction'] entry = format_price(data['entry']) sl = format_price(data['sl']) tp = format_price(data['tp']) tf = data['timeframe'].upper() note = "Mr.CopriderBot Signal" ts = data['timestamp']
 
-def log_to_csv(symbol, entry, direction, event):
-    time_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    row = f"{time_now},{symbol},{entry},{direction},{event}\n"
-    if not os.path.exists(log_file):
-        with open(log_file, "w") as f:
-            f.write("timestamp,symbol,entry,direction,event\n")
-    with open(log_file, "a") as f:
-        f.write(row)
+return f"\ud83d\udcc8 *{symbol}* `{tf}`\n*{direction} Signal*\n\n*Entry:* `{entry}`\n*SL:* `{sl}`\n*TP:* `{tp}`\n\n{note}\n`{ts}`"
 
-def format_timeframe(tf):
-    if tf is None:
-        return "Unknown"
-    tf_map = {
-        "1": "1M", "3": "3M", "5": "5M", "15": "15M", "30": "30M",
-        "60": "H1", "120": "H2", "180": "H3", "240": "H4",
-        "D": "Daily", "W": "Weekly", "M": "Monthly"
-    }
-    return tf_map.get(str(tf).upper(), str(tf).upper())
+=== SEND TELEGRAM ===
 
-# === Webhook Endpoint ===
-@app.route("/", methods=["GET", "POST"])
-def index():
-    if request.method == "GET":
-        return "✅ Mr. Coprider Signal Bot is Active"
+def send_telegram_message(text): res = requests.post(TELEGRAM_URL, json={ "chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown" }) return res.json().get("result", {}).get("message_id")
 
-    data = request.get_json()
-    if not data:
-        return jsonify({"error": "No data received"}), 400
+=== HANDLE SIGNAL ===
 
-    symbol = data.get("symbol", "").upper()
-    entry = float(data.get("entry", 0))
-    direction = data.get("direction")
-    sl = float(data.get("sl", 0))
-    tp = float(data.get("tp", 0))
-    note = "Mr.CopriderBot Signal"
-    tf = format_timeframe(data.get("timeframe"))
-    ts = data.get("timestamp")
+@app.route('/', methods=['POST']) def webhook(): data = request.json symbol = data['symbol'] direction = data['direction'] entry = float(data['entry']) sl = float(data['sl']) tp = float(data['tp']) note = data.get('note', '') tf = data.get('timeframe', '') ts = data.get('timestamp', time.strftime("%Y-%m-%d %H:%M:%S"))
 
-    if not symbol or not entry or not direction:
-        return jsonify({"error": "Missing key fields"}), 400
+# Insert into DB
+c.execute('''INSERT INTO trades (symbol, direction, entry, sl, tp, note, timeframe, timestamp)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+          (symbol, direction, entry, sl, tp, note, tf, ts))
+conn.commit()
 
-    pip_size = pip_sizes.get(symbol)
-    if not pip_size:
-        return jsonify({"error": f"Pip size unknown for {symbol}"}), 400
+# Send Telegram
+msg_id = send_telegram_message(format_signal(data))
+c.execute("UPDATE trades SET message_id = ? WHERE rowid = last_insert_rowid()", (msg_id,))
+conn.commit()
 
-    signals = load_signals()
-    if symbol not in signals:
-        signals[symbol] = {
-            "entry": entry,
-            "direction": direction,
-            "sl_hit": False,
-            **{f"hit_{p}": False for p in pip_targets}
-        }
-        save_signals(signals)
+return {"status": "ok"}
 
-        msg = f"\ud83d\udce4 *New Trade Entry:* {symbol} {direction}\n"
-        msg += f"\ud83c\udfaf Entry: `{round(entry, 2)}`"
-        msg += f"\n\ud83d\uded1 SL: `{round(sl, 2)}`"
-        msg += f"\n\ud83c\udfaf TP: `{round(tp, 2)}`"
-        msg += f"\n\ud83d\udd52 TF: {tf}"
-        msg += f"\n\ud83d\udcdd Signal By: {note}"
-        send_telegram(msg)
-        return jsonify({"message": "New entry saved"}), 200
+=== PRICE TRACKING ===
 
-    old = signals[symbol]
-    if old.get("sl_hit"):
-        return jsonify({"message": "SL already hit, ignoring update"}), 200
+def poll_price_updates(): while True: c.execute("SELECT rowid, * FROM trades WHERE status = 'open'") rows = c.fetchall() for row in rows: rowid, _, symbol, direction, entry, sl, tp, note, tf, ts, status, msg_id = row
 
-    pips_moved = (entry - old["entry"]) / pip_size if direction == "Sell" else (entry - old["entry"]) / pip_size
-    pips_moved = round(pips_moved, 2)
+# Example price update call (replace with real API later)
+        price = fetch_price(symbol)
+        
+        pips = ((price - entry) if direction == "Buy" else (entry - price)) * get_pip_factor(symbol)
+        
+        if (direction == "Buy" and price >= tp) or (direction == "Sell" and price <= tp):
+            post_update(msg_id, symbol, direction, entry, price, tp, sl, pips, hit="TP")
+            c.execute("UPDATE trades SET status = 'tp_hit' WHERE rowid = ?", (rowid,))
+        elif (direction == "Buy" and price <= sl) or (direction == "Sell" and price >= sl):
+            post_update(msg_id, symbol, direction, entry, price, tp, sl, pips, hit="SL")
+            c.execute("UPDATE trades SET status = 'sl_hit' WHERE rowid = ?", (rowid,))
+        conn.commit()
+    time.sleep(10)
 
-    if direction == "Buy" and entry <= sl:
-        signals[symbol]["sl_hit"] = True
-        save_signals(signals)
-        send_telegram(f"\ud83d\uded1 *Stop Loss Hit!* {symbol} ({direction})\n\ud83d\udca5 Entry: `{round(old['entry'], 2)}` → SL: `{round(entry, 2)}`\n\ud83d\udd52 TF: {tf}")
-        log_to_csv(symbol, old["entry"], direction, "SL HIT")
-        return jsonify({"message": "Stop loss hit"}), 200
-    elif direction == "Sell" and entry >= sl:
-        signals[symbol]["sl_hit"] = True
-        save_signals(signals)
-        send_telegram(f"\ud83d\uded1 *Stop Loss Hit!* {symbol} ({direction})\n\ud83d\udca5 Entry: `{round(old['entry'], 2)}` → SL: `{round(entry, 2)}`\n\ud83d\udd52 TF: {tf}")
-        log_to_csv(symbol, old["entry"], direction, "SL HIT")
-        return jsonify({"message": "Stop loss hit"}), 200
+=== PRICE FETCHING ===
 
-    hit_pips = []
-    for p in pip_targets:
-        if not old[f"hit_{p}"] and pips_moved >= p:
-            old[f"hit_{p}"] = True
-            hit_pips.append(p)
-            send_telegram(f"\ud83c\udfaf *{symbol}* hit `{p}` pips \u2705\n\ud83d\udcc8 From: `{round(old['entry'], 2)}` → Now: `{round(entry, 2)}`\n\ud83d\udccf Moved: `{pips_moved}` pips")
-            log_to_csv(symbol, old["entry"], direction, f"{p} Pips")
+def fetch_price(symbol): # MOCK ONLY — replace with real broker API return 1.0  # constant for dev testing
 
-    if hit_pips:
-        save_signals(signals)
-        return jsonify({"message": f"Pips hit: {hit_pips}"}), 200
+def get_pip_factor(symbol): pips10 = ["XAUUSD", "US30", "NAS100", "GER40"] return 0.1 if symbol.upper() in pips10 else 0.0001
 
-    return jsonify({"message": "No milestone or SL triggered"}), 200
+=== UPDATE POST ===
 
-# === Run App ===
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000)
-    
+def post_update(msg_id, symbol, direction, entry, price, tp, sl, pips, hit="TP"): emoji = "\ud83c\udf89" if hit == "TP" else "\u274c" text = f"{emoji} {symbol} {direction} {hit} Hit\n\nEntry: {format_price(entry)}\nHit: {format_price(price)}\n{hit}: {format_price(tp if hit=="TP" else sl)}\n\nPips: {round(pips,1)}" requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json={ "chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown", "reply_to_message_id": msg_id })
+
+=== START POLLING ===
+
+import threading threading.Thread(target=poll_price_updates, daemon=True).start()
+
+=== RUN ===
+
+if name == 'main': app.run(host='0.0.0.0', port=80)
+
