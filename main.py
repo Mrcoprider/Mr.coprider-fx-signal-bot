@@ -175,10 +175,13 @@ if __name__ == "__main__":
 
     
     from flask import send_file
+from datetime import datetime
 
 @app.route("/download-db", methods=["GET"])
 def download_db():
     try:
-        return send_file(DB_FILE, as_attachment=True)
+        date_str = datetime.now().strftime("%d-%b-%Y")
+        filename = f"signals_{date_str}.db"
+        return send_file(DB_FILE, as_attachment=True, download_name=filename)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
