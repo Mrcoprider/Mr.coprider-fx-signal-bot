@@ -250,6 +250,17 @@ def show_trades():
 
     html += "</table></body></html>"
     return html
+    @app.route("/migrate-add-message-id", methods=["GET"])
+def migrate_add_message_id():
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("ALTER TABLE trades ADD COLUMN message_id INTEGER")
+        conn.commit()
+        conn.close()
+        return "✅ Migration successful: `message_id` column added."
+    except Exception as e:
+        return f"⚠️ Migration error: {str(e)}"
 
 # === MAIN ===
 if __name__ == "__main__":
