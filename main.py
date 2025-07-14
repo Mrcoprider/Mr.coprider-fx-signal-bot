@@ -65,8 +65,8 @@ def round_price(value, symbol):
     return round(value, 5)
 
 def calc_pips(symbol, entry, price):
-    pip_size = 0.01 if "JPY" in symbol or "XAU" in symbol or "XAG" in symbol else 0.0001
-    return round((abs(price - entry)) / pip_size)
+    pip_size = 0.01 if any(x in symbol for x in ["JPY", "XAU", "XAG"]) else 0.0001
+    return round(abs(price - entry) / pip_size)
 
 # === TELEGRAM ===
 def send_telegram(message):
@@ -78,7 +78,7 @@ def send_telegram(message):
     }
     requests.post(url, json=payload)
 
-# === ROUTE ===
+# === / ===
 @app.route("/", methods=["POST"])
 def receive_signal():
     data = request.get_json()
@@ -120,7 +120,7 @@ TP: {tp}
     send_telegram(message)
     return jsonify({"message": "Signal posted"})
 
-# === POLLING TO CHECK SL/TP + PIP MILESTONES ===
+# === /poll ===
 @app.route("/poll", methods=["GET"])
 def poll_prices():
     conn = sqlite3.connect(DB_FILE)
@@ -131,13 +131,12 @@ def poll_prices():
     for row in rows:
         trade_id, symbol, direction, entry, sl, tp, tf, note, timestamp, status, pips_hit = row
 
-        # Fetch live price (placeholder logic)
-        # Replace this with real-time price from your broker/API
-        current_price = entry  # Should be replaced with actual quote
+        # 🔁 Live price placeholder (replace with broker API)
+        current_price = entry  # ⚠️ Replace with real-time quote logic
 
-        hit_message = None
-        closed = False
         pip_gain = calc_pips(symbol, entry, current_price)
+        closed = False
+        hit_message = None
 
         if direction.lower() == "buy":
             if current_price >= tp:
@@ -160,12 +159,11 @@ def poll_prices():
             send_telegram(hit_message)
             continue
 
-        # Pip milestones
         for milestone in PIP_MILESTONES:
             if pip_gain >= milestone and f"{milestone}" not in pips_hit.split(","):
                 send_telegram(f"📶 *{milestone} pips* reached on {symbol}")
-                new_hits = f"{pips_hit},{milestone}".strip(",")
-                c.execute("UPDATE trades SET pips_hit = ? WHERE id = ?", (new_hits, trade_id))
+                updated = ",".join(filter(None, [pips_hit, str(milestone)]))
+                c.execute("UPDATE trades SET pips_hit = ? WHERE id = ?", (updated, trade_id))
                 conn.commit()
 
     conn.close()
