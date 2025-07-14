@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 import sqlite3
 import requests
 from datetime import datetime
@@ -78,7 +78,7 @@ def send_telegram(message):
     }
     requests.post(url, json=payload)
 
-# === / ===
+# === SIGNAL POSTING ROUTE ===
 @app.route("/", methods=["POST"])
 def receive_signal():
     data = request.get_json()
@@ -94,7 +94,6 @@ def receive_signal():
     timestamp_raw = data.get("timestamp", "")
     timestamp = format_time_ist(timestamp_raw)
 
-    # Store
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute('''
@@ -120,7 +119,7 @@ TP: {tp}
     send_telegram(message)
     return jsonify({"message": "Signal posted"})
 
-# === /poll ===
+# === POLL SL/TP & PIPS TRACKING ===
 @app.route("/poll", methods=["GET"])
 def poll_prices():
     conn = sqlite3.connect(DB_FILE)
@@ -131,8 +130,7 @@ def poll_prices():
     for row in rows:
         trade_id, symbol, direction, entry, sl, tp, tf, note, timestamp, status, pips_hit = row
 
-        # 🔁 Live price placeholder (replace with broker API)
-        current_price = entry  # ⚠️ Replace with real-time quote logic
+        current_price = entry  # Placeholder for live price
 
         pip_gain = calc_pips(symbol, entry, current_price)
         closed = False
@@ -169,14 +167,7 @@ def poll_prices():
     conn.close()
     return jsonify({"message": "Polling complete"})
 
-# === MAIN ===
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080)
-
-    
-    from flask import send_file
-from datetime import datetime
-
+# === DOWNLOAD DATABASE FILE ===
 @app.route("/download-db", methods=["GET"])
 def download_db():
     try:
@@ -185,3 +176,63 @@ def download_db():
         return send_file(DB_FILE, as_attachment=True, download_name=filename)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+# === VIEW TRADE HISTORY TABLE (with filters) ===
+@app.route("/show-trades", methods=["GET"])
+def show_trades():
+    status_filter = request.args.get("status", None)
+    symbol_filter = request.args.get("symbol", None)
+
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+
+    query = "SELECT symbol, direction, entry, sl, tp, timeframe, timestamp, status, pips_hit FROM trades"
+    filters = []
+    params = []
+
+    if status_filter:
+        filters.append("status = ?")
+        params.append(status_filter.lower())
+
+    if symbol_filter:
+        filters.append("symbol = ?")
+        params.append(symbol_filter.upper())
+
+    if filters:
+        query += " WHERE " + " AND ".join(filters)
+
+    query += " ORDER BY id DESC"
+    c.execute(query, tuple(params))
+    rows = c.fetchall()
+    conn.close()
+
+    html = """
+    <html>
+    <head>
+        <title>Mr.Coprider Trades</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <style>
+            body { font-family: Arial; padding: 1em; background: #f4f4f4; }
+            table { width: 100%; border-collapse: collapse; background: #fff; }
+            th, td { padding: 10px; border: 1px solid #ccc; text-align: center; }
+            th { background-color: #222; color: #fff; }
+            tr:nth-child(even) { background: #f9f9f9; }
+            h2 { color: #333; }
+        </style>
+    </head>
+    <body>
+        <h2>📊 Mr.Coprider Bot Trade History</h2>
+        <p><b>Filters:</b> Add <code>?status=open</code> or <code>?symbol=XAUUSD</code> in URL</p>
+        <table>
+            <tr><th>Symbol</th><th>Dir</th><th>Entry</th><th>SL</th><th>TP</th><th>TF</th><th>Time</th><th>Status</th><th>Pips</th></tr>
+    """
+
+    for row in rows:
+        html += "<tr>" + "".join(f"<td>{cell}</td>" for cell in row) + "</tr>"
+
+    html += "</table></body></html>"
+    return html
+
+# === MAIN ===
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080)
