@@ -1,5 +1,4 @@
-import json 
-import time import requests import sqlite3 from flask import Flask, request
+import json import time import requests import sqlite3 from flask import Flask, request
 
 app = Flask(name)
 
