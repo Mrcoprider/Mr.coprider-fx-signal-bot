@@ -1,137 +1,138 @@
 import json
-import time
-import requests
 import sqlite3
-from flask import Flask, request
 from datetime import datetime
 import pytz
-
-BOT_TOKEN = "7542580180:AAFTa-QVS344MgPlsnvkYRZeenZ-RINvOoc"
-CHAT_ID = "-1002507284584"
-TELEGRAM_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-
-DB_FILE = "signals.db"
+import requests
+from flask import Flask, request
 
 app = Flask(__name__)
 
-# --- Setup DB ---
+# === CONFIG ===
+BOT_TOKEN = "7542580180:AAFTa-QVS344MgPlsnvkYRZeenZ-RINvOoc"
+CHAT_ID = "-1002507284584"
+DB_PATH = "signals.db"
+
+# === DATABASE SETUP ===
 def init_db():
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS signals (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        symbol TEXT,
-        direction TEXT,
-        entry REAL,
-        sl REAL,
-        tp REAL,
-        note TEXT,
-        timeframe TEXT,
-        timestamp TEXT,
-        status TEXT,
-        message_id INTEGER,
-        chat_id TEXT
-    )''')
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT,
+                    direction TEXT,
+                    entry REAL,
+                    sl REAL,
+                    tp REAL,
+                    note TEXT,
+                    timeframe TEXT,
+                    timestamp TEXT,
+                    telegram_message_id TEXT,
+                    status TEXT
+                )''')
     conn.commit()
     conn.close()
 
-init_db()
+# === PIP SIZE MAP ===
+pip_map = {
+    "XAUUSD": 0.1,
+    "XAGUSD": 0.01,
+    "US30": 1,
+    "NAS100": 1,
+    "SPX500": 0.1,
+    "GER30": 1,
+    "UK100": 1,
+    "USDJPY": 0.01,
+    "JPY": 0.01,
+    "BTCUSD": 1,
+    "ETHUSD": 0.01,
+    "DXY": 0.01
+}
+default_pip_size = 0.0001
 
-# --- Format Helpers ---
-def format_time_ist(timestamp):
-    try:
-        utc_time = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S").replace(tzinfo=pytz.utc)
-        ist_time = utc_time.astimezone(pytz.timezone("Asia/Kolkata"))
-        return ist_time.strftime("%d-%b-%Y %I:%M %p")
-    except Exception:
-        return timestamp
-
+# === FORMAT TIMEFRAME ===
 def format_timeframe(tf):
-    if tf == "1":
-        return "1M"
-    elif tf == "3":
-        return "3M"
-    elif tf == "5":
-        return "5M"
-    elif tf == "15":
-        return "15M"
-    elif tf == "30":
-        return "30M"
-    elif tf in ["60", "1H"]:
-        return "H1"
-    elif tf in ["120", "2H"]:
-        return "H2"
-    elif tf in ["180", "3H"]:
-        return "H3"
-    elif tf in ["240", "4H"]:
-        return "H4"
-    elif tf in ["D", "1D"]:
-        return "Daily"
-    elif tf in ["W", "1W"]:
-        return "Weekly"
-    else:
-        return tf + " TF"
+    tf_map = {
+        "1": "1M", "3": "3M", "5": "5M", "15": "15M",
+        "30": "30M", "60": "H1", "120": "H2", "180": "H3", "240": "H4",
+        "D": "Daily", "W": "Weekly"
+    }
+    return tf_map.get(tf, tf + "M")
 
-# --- Telegram Message ---
-def format_telegram_msg(data):
-    tf = format_timeframe(data["timeframe"])
-    t = format_time_ist(data["timestamp"])
-    emoji = "🟢" if data["direction"].lower() == "buy" else "🔴"
-    msg = f"""
-📡 Mr.Coprider Bot Signal
+# === CONVERT TO IST ===
+def convert_to_ist(utc_string):
+    utc_time = datetime.strptime(utc_string, "%Y-%m-%d %H:%M:%S")
+    utc = pytz.utc
+    ist = pytz.timezone("Asia/Kolkata")
+    local_time = utc.localize(utc_time).astimezone(ist)
+    return local_time.strftime("%d-%b-%Y %I:%M %p")
 
-{emoji} *{data['symbol']}* | *{data['direction'].upper()}*
-*Timeframe:* {tf}
-*Entry:* {round(data['entry'], 2)}
-*SL:* {round(data['sl'], 2)}
-*TP:* {round(data['tp'], 2)}
-🕐 {t}
-📝 {data['note']}
-"""
-    return msg.strip()
+# === ROUND LEVELS ===
+def round_level(symbol, price):
+    pip_size = pip_map.get(symbol, default_pip_size)
+    precision = abs(int(round(-1 * (pip_size).as_integer_ratio()[1]).bit_length() / 3))  # rough estimator
+    return round(price, precision if pip_size < 1 else 2)
 
-def send_to_telegram(message):
+# === TELEGRAM SEND ===
+def send_telegram_message(text):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": CHAT_ID,
-        "text": message,
+        "text": text,
         "parse_mode": "Markdown"
     }
-    r = requests.post(TELEGRAM_URL, json=payload)
+    r = requests.post(url, json=payload)
     if r.status_code == 200:
-        result = r.json()
-        return result.get("result", {}).get("message_id", None)
+        return r.json()["result"]["message_id"]
     return None
 
-# --- POST Endpoint ---
+# === TELEGRAM FOLLOW-UP ===
+def send_followup(symbol, direction, result, pips, original_note):
+    emoji = "🎯" if result == "TP HIT" else "🛑"
+    text = f"{emoji} *{symbol} | {direction}* {result}!\n🎯 Pips Gained: *{pips}*\n📝 {original_note}"
+    send_telegram_message(text)
+
+# === SIGNAL POST ===
 @app.route("/", methods=["POST"])
-def receive_signal():
+def handle_signal():
     data = request.get_json()
-    required_keys = {"symbol", "direction", "entry", "sl", "tp", "note", "timeframe", "timestamp"}
-    if not data or not required_keys.issubset(data):
-        return {"error": "Invalid JSON payload"}, 400
 
-    # Insert into DB
-    conn = sqlite3.connect(DB_FILE)
+    symbol = data["symbol"]
+    direction = data["direction"]
+    entry = round_level(symbol, float(data["entry"]))
+    sl = round_level(symbol, float(data["sl"]))
+    tp = round_level(symbol, float(data["tp"]))
+    note = data.get("note", "Mr.CopriderBot Signal")
+    timeframe = format_timeframe(data.get("timeframe", "15"))
+    timestamp = convert_to_ist(data["timestamp"])
+
+    # Message formatting
+    emoji = "🟢" if direction.lower() == "buy" else "🔴"
+    message = (
+        f"📡 *Mr.Coprider Bot Signal*\n\n"
+        f"{emoji} *{symbol} | {direction.upper()}*\n"
+        f"Timeframe: *{timeframe}*\n"
+        f"Entry: *{entry}*\n"
+        f"SL: *{sl}*\n"
+        f"TP: *{tp}*\n"
+        f"🕐 {timestamp}\n"
+        f"📝 {note}"
+    )
+
+    msg_id = send_telegram_message(message)
+
+    # Log to DB
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("INSERT INTO signals (symbol, direction, entry, sl, tp, note, timeframe, timestamp, status, message_id, chat_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", 
-              (data["symbol"], data["direction"], data["entry"], data["sl"], data["tp"], data["note"], data["timeframe"], data["timestamp"], "active", None, CHAT_ID))
+    c.execute('''INSERT INTO signals 
+                 (symbol, direction, entry, sl, tp, note, timeframe, timestamp, telegram_message_id, status)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+              (symbol, direction, entry, sl, tp, note, timeframe, timestamp, msg_id, "active"))
     conn.commit()
-    signal_id = c.lastrowid
     conn.close()
-
-    # Send Message
-    message = format_telegram_msg(data)
-    msg_id = send_to_telegram(message)
-
-    # Update message ID
-    if msg_id:
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("UPDATE signals SET message_id = ? WHERE id = ?", (msg_id, signal_id))
-        conn.commit()
-        conn.close()
 
     return {"message": "Signal posted"}
 
+# === INIT ===
 if __name__ == "__main__":
-    app.run(debug=False, host="0.0.0.0", port=8080)
+    init_db()
+    app.run(host="0.0.0.0", port=8080)
