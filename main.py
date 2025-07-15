@@ -72,25 +72,29 @@ def calc_pips(symbol, entry, price):
     pip_size = 0.01 if any(x in symbol for x in ["JPY", "XAU", "XAG"]) else 0.0001
     return round(abs(price - entry) / pip_size)
 
-# === LIVE PRICE ===
+# === LIVE PRICE (Alpha Vantage) ===
 def fetch_live_price(symbol):
     fx_symbol = symbol.upper().replace("/", "")
     base = fx_symbol[:3]
     quote = fx_symbol[3:]
+
     url = f"https://www.alphavantage.co/query?function=CURRENCY_EXCHANGE_RATE&from_currency={base}&to_currency={quote}&apikey={ALPHA_VANTAGE_API_KEY}"
 
     try:
         response = requests.get(url, timeout=10).json()
         price = float(response["Realtime Currency Exchange Rate"]["5. Exchange Rate"])
         return round(price, 5)
-    except:
+    except Exception as e:
+        print(f"[AlphaVantage Fallback] Error: {e}")
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
         c.execute("SELECT entry FROM trades WHERE symbol = ? ORDER BY id DESC LIMIT 1", (symbol,))
         result = c.fetchone()
         conn.close()
         if result:
-            return round(result[0] + random.uniform(-0.005, 0.005), 5)
+            base_price = result[0]
+            variation = random.uniform(-0.005, 0.005)
+            return round(base_price + variation, 5)
         return 0
 
 # === TELEGRAM ===
@@ -103,7 +107,7 @@ def send_telegram(message):
     }
     requests.post(url, json=payload)
 
-# === SIGNAL POST ===
+# === RECEIVE SIGNAL ===
 @app.route("/", methods=["POST"])
 def receive_signal():
     data = request.get_json()
@@ -120,6 +124,26 @@ def receive_signal():
 
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
+
+    # === FILTER DUPLICATES & TIME SPAM ===
+    c.execute('''
+        SELECT timestamp FROM trades
+        WHERE symbol = ? AND direction = ? AND timeframe = ? AND status = 'open'
+        ORDER BY id DESC LIMIT 1
+    ''', (symbol, direction, tf))
+    row = c.fetchone()
+
+    if row:
+        try:
+            last_time = datetime.strptime(row[0], "%d-%b-%Y %I:%M %p")
+            now_ist = datetime.now(pytz.timezone("Asia/Kolkata"))
+            minutes_diff = (now_ist - last_time).total_seconds() / 60
+            if minutes_diff < 15:
+                conn.close()
+                return jsonify({"message": f"Duplicate signal skipped: {symbol} {direction} ({tf}) <15min"})
+        except:
+            pass
+
     c.execute('''
         INSERT INTO trades (symbol, direction, entry, sl, tp, timeframe, note, timestamp)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -143,56 +167,50 @@ TP: {tp}
     send_telegram(message)
     return jsonify({"message": "Signal posted"})
 
-# === MANUAL POLL ROUTE ===
-@app.route("/poll", methods=["GET"])
+# === POLLING ROUTE ===
 def poll_prices():
-    poll_job()
-    return jsonify({"message": "Manual polling complete"})
+    with app.app_context():
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT * FROM trades WHERE status = 'open'")
+        rows = c.fetchall()
 
-# === BACKGROUND POLLING JOB ===
-def poll_job():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT * FROM trades WHERE status = 'open'")
-    rows = c.fetchall()
+        for row in rows:
+            trade_id, symbol, direction, entry, sl, tp, tf, note, timestamp, status, pips_hit, message_id = row
+            current_price = fetch_live_price(symbol)
+            pip_gain = calc_pips(symbol, entry, current_price)
+            closed = False
+            hit_message = None
 
-    for row in rows:
-        trade_id, symbol, direction, entry, sl, tp, tf, note, timestamp, status, pips_hit, message_id = row
-        current_price = fetch_live_price(symbol)
-        pip_gain = calc_pips(symbol, entry, current_price)
-        closed = False
-        hit_message = None
+            if direction.lower() == "buy":
+                if current_price >= tp:
+                    hit_message = f"🎯 *TP Hit* on {symbol} | +{pip_gain} pips"
+                    closed = True
+                elif current_price <= sl:
+                    hit_message = f"🛑 *SL Hit* on {symbol} | -{pip_gain} pips"
+                    closed = True
+            elif direction.lower() == "sell":
+                if current_price <= tp:
+                    hit_message = f"🎯 *TP Hit* on {symbol} | +{pip_gain} pips"
+                    closed = True
+                elif current_price >= sl:
+                    hit_message = f"🛑 *SL Hit* on {symbol} | -{pip_gain} pips"
+                    closed = True
 
-        if direction.lower() == "buy":
-            if current_price >= tp:
-                hit_message = f"🎯 *TP Hit* on {symbol} | +{pip_gain} pips"
-                closed = True
-            elif current_price <= sl:
-                hit_message = f"🛑 *SL Hit* on {symbol} | -{pip_gain} pips"
-                closed = True
-        elif direction.lower() == "sell":
-            if current_price <= tp:
-                hit_message = f"🎯 *TP Hit* on {symbol} | +{pip_gain} pips"
-                closed = True
-            elif current_price >= sl:
-                hit_message = f"🛑 *SL Hit* on {symbol} | -{pip_gain} pips"
-                closed = True
-
-        if closed:
-            c.execute("UPDATE trades SET status = 'closed' WHERE id = ?", (trade_id,))
-            conn.commit()
-            send_telegram(hit_message)
-            continue
-
-        for milestone in PIP_MILESTONES:
-            if pip_gain >= milestone and f"{milestone}" not in pips_hit.split(","):
-                send_telegram(f"📶 *{milestone} pips* reached on {symbol}")
-                updated = ",".join(filter(None, [pips_hit, str(milestone)]))
-                c.execute("UPDATE trades SET pips_hit = ? WHERE id = ?", (updated, trade_id))
+            if closed:
+                c.execute("UPDATE trades SET status = 'closed' WHERE id = ?", (trade_id,))
                 conn.commit()
+                send_telegram(hit_message)
+                continue
 
-    conn.close()
-    print("[Polling] Checked all open trades.")
+            for milestone in PIP_MILESTONES:
+                if pip_gain >= milestone and f"{milestone}" not in pips_hit.split(","):
+                    send_telegram(f"📶 *{milestone} pips* reached on {symbol}")
+                    updated = ",".join(filter(None, [pips_hit, str(milestone)]))
+                    c.execute("UPDATE trades SET pips_hit = ? WHERE id = ?", (updated, trade_id))
+                    conn.commit()
+
+        conn.close()
 
 # === DB DOWNLOAD ===
 @app.route("/download-db", methods=["GET"])
@@ -204,7 +222,7 @@ def download_db():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# === TRADE HISTORY TABLE ===
+# === VIEW TRADES ===
 @app.route("/show-trades", methods=["GET"])
 def show_trades():
     status_filter = request.args.get("status", None)
@@ -257,7 +275,7 @@ def show_trades():
 
 # === SCHEDULER ===
 scheduler = BackgroundScheduler()
-scheduler.add_job(poll_job, "interval", seconds=30)
+scheduler.add_job(poll_prices, 'interval', seconds=30)
 scheduler.start()
 
 # === MAIN ===
