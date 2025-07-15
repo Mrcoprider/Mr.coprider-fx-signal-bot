@@ -3,6 +3,7 @@ import sqlite3
 import requests
 from datetime import datetime
 import pytz
+import random
 
 app = Flask(__name__)
 
@@ -11,6 +12,7 @@ BOT_TOKEN = "7542580180:AAFTa-QVS344MgPlsnvkYRZeenZ-RINvOoc"
 CHAT_ID = "-1002507284584"
 DB_FILE = "signals.db"
 PIP_MILESTONES = [50, 100, 150, 200, 250, 300]
+ALPHA_VANTAGE_API_KEY = "OQIDE6XSFM8O6XHD"
 
 # === DB INIT ===
 def init_db():
@@ -28,13 +30,25 @@ def init_db():
             note TEXT,
             timestamp TEXT,
             status TEXT DEFAULT 'open',
-            pips_hit TEXT DEFAULT ''
+            pips_hit TEXT DEFAULT '',
+            message_id INTEGER
         )
     ''')
     conn.commit()
     conn.close()
 
+def ensure_message_id_column():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    try:
+        c.execute("ALTER TABLE trades ADD COLUMN message_id INTEGER")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    conn.close()
+
 init_db()
+ensure_message_id_column()
 
 # === FORMATTERS ===
 def format_tf(tf):
@@ -68,6 +82,31 @@ def calc_pips(symbol, entry, price):
     pip_size = 0.01 if any(x in symbol for x in ["JPY", "XAU", "XAG"]) else 0.0001
     return round(abs(price - entry) / pip_size)
 
+# === LIVE PRICE (Alpha Vantage) ===
+def fetch_live_price(symbol):
+    fx_symbol = symbol.upper().replace("/", "")
+    base = fx_symbol[:3]
+    quote = fx_symbol[3:]
+
+    url = f"https://www.alphavantage.co/query?function=CURRENCY_EXCHANGE_RATE&from_currency={base}&to_currency={quote}&apikey={ALPHA_VANTAGE_API_KEY}"
+
+    try:
+        response = requests.get(url, timeout=10).json()
+        price = float(response["Realtime Currency Exchange Rate"]["5. Exchange Rate"])
+        return round(price, 5)
+    except Exception as e:
+        print(f"[AlphaVantage Fallback] Error: {e}")
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT entry FROM trades WHERE symbol = ? ORDER BY id DESC LIMIT 1", (symbol,))
+        result = c.fetchone()
+        conn.close()
+        if result:
+            base_price = result[0]
+            variation = random.uniform(-0.005, 0.005)
+            return round(base_price + variation, 5)
+        return 0
+
 # === TELEGRAM ===
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -77,30 +116,11 @@ def send_telegram(message):
         "parse_mode": "Markdown"
     }
     requests.post(url, json=payload)
-    import random
-
-def fetch_live_price(symbol):
-    """
-    Mock live price fetcher. Replace with real broker/API later.
-    Adds small random variation to simulate price movement.
-    """
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT entry FROM trades WHERE symbol = ? ORDER BY id DESC LIMIT 1", (symbol,))
-    result = c.fetchone()
-    conn.close()
-
-    if result:
-        base = result[0]
-        variation = random.uniform(-0.005, 0.005)  # Simulate slight price change
-        return round(base + variation, 5)
-    return 0
 
 # === SIGNAL POSTING ROUTE ===
 @app.route("/", methods=["POST"])
 def receive_signal():
     data = request.get_json()
-
     symbol = data.get("symbol", "").replace("{{ticker}}", "").strip().upper()
     raw_tf = data.get("timeframe", "").replace("{{interval}}", "").replace("{{INTERVAL}}", "").strip()
     tf = format_tf(raw_tf) if raw_tf else "N/A"
@@ -135,35 +155,6 @@ TP: {tp}
 """.strip()
 
     send_telegram(message)
-    import random
-
-ALPHA_VANTAGE_API_KEY = "OQIDE6XSFM8O6XHD"
-
-def fetch_live_price(symbol):
-    fx_symbol = symbol.upper().replace("/", "")
-    base = fx_symbol[:3]
-    quote = fx_symbol[3:]
-
-    url = f"https://www.alphavantage.co/query?function=CURRENCY_EXCHANGE_RATE&from_currency={base}&to_currency={quote}&apikey={"OQIDE6XSFM8O6XHD"}"
-
-    try:
-        response = requests.get(url, timeout=10).json()
-        price = float(response["Realtime Currency Exchange Rate"]["5. Exchange Rate"])
-        return round(price, 5)
-    except Exception as e:
-        print(f"[AlphaVantage Fallback] Error: {e}")
-        # Fallback: use entry + random small delta
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("SELECT entry FROM trades WHERE symbol = ? ORDER BY id DESC LIMIT 1", (symbol,))
-        result = c.fetchone()
-        conn.close()
-
-        if result:
-            base_price = result[0]
-            variation = random.uniform(-0.005, 0.005)
-            return round(base_price + variation, 5)
-        return 0
     return jsonify({"message": "Signal posted"})
 
 # === POLL SL/TP & PIPS TRACKING ===
@@ -175,10 +166,8 @@ def poll_prices():
     rows = c.fetchall()
 
     for row in rows:
-        trade_id, symbol, direction, entry, sl, tp, tf, note, timestamp, status, pips_hit = row
-
+        trade_id, symbol, direction, entry, sl, tp, tf, note, timestamp, status, pips_hit, message_id = row
         current_price = fetch_live_price(symbol)
-
         pip_gain = calc_pips(symbol, entry, current_price)
         closed = False
         hit_message = None
@@ -224,7 +213,7 @@ def download_db():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# === VIEW TRADE HISTORY TABLE (with filters) ===
+# === VIEW TRADE HISTORY TABLE ===
 @app.route("/show-trades", methods=["GET"])
 def show_trades():
     status_filter = request.args.get("status", None)
@@ -232,7 +221,6 @@ def show_trades():
 
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-
     query = "SELECT symbol, direction, entry, sl, tp, timeframe, timestamp, status, pips_hit FROM trades"
     filters = []
     params = []
@@ -240,11 +228,9 @@ def show_trades():
     if status_filter:
         filters.append("status = ?")
         params.append(status_filter.lower())
-
     if symbol_filter:
         filters.append("symbol = ?")
         params.append(symbol_filter.upper())
-
     if filters:
         query += " WHERE " + " AND ".join(filters)
 
@@ -273,16 +259,13 @@ def show_trades():
         <table>
             <tr><th>Symbol</th><th>Dir</th><th>Entry</th><th>SL</th><th>TP</th><th>TF</th><th>Time</th><th>Status</th><th>Pips</th></tr>
     """
-
     for row in rows:
         html += "<tr>" + "".join(f"<td>{cell}</td>" for cell in row) + "</tr>"
-
     html += "</table></body></html>"
     return html
-    @app.route("/migrate-add-message-id", methods=["GET"])
-    # === DB INIT ===
-def init_db():
-    ...
+
+# === MIGRATION ROUTE (optional) ===
+@app.route("/migrate-add-message-id", methods=["GET"])
 def migrate_add_message_id():
     try:
         conn = sqlite3.connect(DB_FILE)
@@ -293,8 +276,6 @@ def migrate_add_message_id():
         return "✅ Migration successful: `message_id` column added."
     except Exception as e:
         return f"⚠️ Migration error: {str(e)}"
-        init_db()
-ensure_message_id_column()
 
 # === MAIN ===
 if __name__ == "__main__":
