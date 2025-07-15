@@ -144,7 +144,7 @@ def fetch_live_price(symbol):
     base = fx_symbol[:3]
     quote = fx_symbol[3:]
 
-    url = f"https://www.alphavantage.co/query?function=CURRENCY_EXCHANGE_RATE&from_currency={base}&to_currency={quote}&apikey={ALPHA_VANTAGE_API_KEY}"
+    url = f"https://www.alphavantage.co/query?function=CURRENCY_EXCHANGE_RATE&from_currency={base}&to_currency={quote}&apikey={"OQIDE6XSFM8O6XHD"}"
 
     try:
         response = requests.get(url, timeout=10).json()
