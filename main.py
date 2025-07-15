@@ -1,7 +1,7 @@
 from flask import Flask, request, jsonify, send_file
 import sqlite3
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 import random
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -12,7 +12,6 @@ app = Flask(__name__)
 BOT_TOKEN = "7542580180:AAFTa-QVS344MgPlsnvkYRZeenZ-RINvOoc"
 CHAT_ID = "-1002507284584"
 DB_FILE = "signals.db"
-PIP_MILESTONES = [50, 100, 150, 200, 250, 300]
 ALPHA_VANTAGE_API_KEY = "OQIDE6XSFM8O6XHD"
 
 # === DB INIT ===
@@ -32,7 +31,8 @@ def init_db():
             timestamp TEXT,
             status TEXT DEFAULT 'open',
             pips_hit TEXT DEFAULT '',
-            message_id INTEGER
+            message_id INTEGER,
+            entry_time_utc TEXT
         )
     ''')
     conn.commit()
@@ -82,8 +82,7 @@ def fetch_live_price(symbol):
         response = requests.get(url, timeout=10).json()
         price = float(response["Realtime Currency Exchange Rate"]["5. Exchange Rate"])
         return round(price, 5)
-    except Exception as e:
-        print(f"[AlphaVantage Fallback] Error: {e}")
+    except:
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
         c.execute("SELECT entry FROM trades WHERE symbol = ? ORDER BY id DESC LIMIT 1", (symbol,))
@@ -116,12 +115,14 @@ def receive_signal():
     timestamp_raw = data.get("timestamp", "")
     timestamp = format_time_ist(timestamp_raw)
 
+    entry_time_utc = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute('''
-        INSERT INTO trades (symbol, direction, entry, sl, tp, timeframe, note, timestamp)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (symbol, direction, entry, sl, tp, tf, note, timestamp))
+        INSERT INTO trades (symbol, direction, entry, sl, tp, timeframe, note, timestamp, entry_time_utc)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (symbol, direction, entry, sl, tp, tf, note, timestamp, entry_time_utc))
     conn.commit()
     conn.close()
 
@@ -149,13 +150,9 @@ def poll_prices():
     rows = c.fetchall()
 
     for row in rows:
-        trade_id, symbol, direction, entry, sl, tp, tf, note, timestamp, status, pips_hit, message_id = row
+        trade_id, symbol, direction, entry, sl, tp, tf, note, timestamp, status, pips_hit, message_id, entry_time_utc = row
         current_price = fetch_live_price(symbol)
-
-        print(f"[DEBUG] Trade ID {trade_id}: {symbol} | {direction.upper()} | Entry: {entry}, SL: {sl}, TP: {tp}, Live: {current_price}")
-
         pip_gain = calc_pips(symbol, entry, current_price, direction)
-        print(f"[PIPS] {symbol} | {pip_gain} pips | Milestones hit: {pips_hit}")
         closed = False
         hit_message = None
 
@@ -163,20 +160,16 @@ def poll_prices():
             if current_price >= tp:
                 hit_message = f"🎯 *TP Hit* on {symbol} | +{pip_gain} pips"
                 closed = True
-                print(f"[HIT] TP hit for BUY {symbol} at {current_price}")
             elif current_price <= sl:
-                hit_message = f"🛑 *SL Hit* on {symbol} | -{pip_gain} pips"
+                hit_message = f"🛑 *SL Hit* on {symbol} | -{abs(pip_gain)} pips"
                 closed = True
-                print(f"[HIT] SL hit for BUY {symbol} at {current_price}")
         elif direction.lower() == "sell":
             if current_price <= tp:
                 hit_message = f"🎯 *TP Hit* on {symbol} | +{pip_gain} pips"
                 closed = True
-                print(f"[HIT] TP hit for SELL {symbol} at {current_price}")
             elif current_price >= sl:
-                hit_message = f"🛑 *SL Hit* on {symbol} | -{pip_gain} pips"
+                hit_message = f"🛑 *SL Hit* on {symbol} | -{abs(pip_gain)} pips"
                 closed = True
-                print(f"[HIT] SL hit for SELL {symbol} at {current_price}")
 
         if closed:
             c.execute("UPDATE trades SET status = 'closed' WHERE id = ?", (trade_id,))
@@ -184,12 +177,24 @@ def poll_prices():
             send_telegram(hit_message)
             continue
 
-        for milestone in PIP_MILESTONES:
-            if pip_gain >= milestone and f"{milestone}" not in pips_hit.split(","):
-                send_telegram(f"📶 *{milestone} pips* reached on {symbol}")
-                updated = ",".join(filter(None, [pips_hit, str(milestone)]))
-                c.execute("UPDATE trades SET pips_hit = ? WHERE id = ?", (updated, trade_id))
-                conn.commit()
+        if entry_time_utc:
+            try:
+                entry_dt = datetime.strptime(entry_time_utc, "%Y-%m-%dT%H:%M:%SZ")
+                now_utc = datetime.utcnow()
+                delta = now_utc - entry_dt
+
+                if delta.total_seconds() >= 900 and "15" not in pips_hit:
+                    send_telegram(f"⏱️ 15-mins Update on {symbol} | Current PnL: {pip_gain} pips (from entry: {entry})")
+                    c.execute("UPDATE trades SET pips_hit = ? WHERE id = ?", (pips_hit + ",15", trade_id))
+                    conn.commit()
+
+                if delta.total_seconds() >= 1800 and "30" not in pips_hit:
+                    send_telegram(f"⏱️ 30-mins Update on {symbol} | Current PnL: {pip_gain} pips (from entry: {entry})")
+                    c.execute("UPDATE trades SET pips_hit = ? WHERE id = ?", (pips_hit + ",30", trade_id))
+                    conn.commit()
+
+            except Exception as e:
+                print(f"[TimeCheck] Error: {e}")
 
     conn.close()
 
