@@ -38,18 +38,7 @@ def init_db():
     conn.commit()
     conn.close()
 
-def ensure_message_id_column():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    try:
-        c.execute("ALTER TABLE trades ADD COLUMN message_id INTEGER")
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass
-    conn.close()
-
 init_db()
-ensure_message_id_column()
 
 # === FORMATTERS ===
 def format_tf(tf):
@@ -86,12 +75,11 @@ def calc_pips(symbol, entry, price, direction):
     else:
         return round((entry - price) / pip_size)
 
-# === LIVE PRICE ===
+# === LIVE PRICE (Alpha Vantage) ===
 def fetch_live_price(symbol):
     fx_symbol = symbol.upper().replace("/", "")
     base = fx_symbol[:3]
     quote = fx_symbol[3:]
-
     url = f"https://www.alphavantage.co/query?function=CURRENCY_EXCHANGE_RATE&from_currency={base}&to_currency={quote}&apikey={ALPHA_VANTAGE_API_KEY}"
 
     try:
@@ -126,7 +114,7 @@ def send_telegram(message):
 def receive_signal():
     data = request.get_json()
     symbol = data.get("symbol", "").replace("{{ticker}}", "").strip().upper()
-    raw_tf = data.get("timeframe", "").replace("{{interval}}", "").replace("{{INTERVAL}}", "").strip()
+    raw_tf = data.get("timeframe", "").replace("{{interval}}", "").strip()
     tf = format_tf(raw_tf) if raw_tf else "N/A"
     direction = data.get("direction", "")
     entry = round_price(data.get("entry", 0), symbol)
@@ -161,54 +149,105 @@ TP: {tp}
     send_telegram(message)
     return jsonify({"message": "Signal posted"})
 
-# === POLLING LOGIC ===
+# === POLL LOGIC ===
 def poll_prices():
-    with app.app_context():
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("SELECT * FROM trades WHERE status = 'open'")
-        rows = c.fetchall()
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT * FROM trades WHERE status = 'open'")
+    rows = c.fetchall()
 
-        for row in rows:
-            trade_id, symbol, direction, entry, sl, tp, tf, note, timestamp, status, pips_hit, message_id = row
-            current_price = fetch_live_price(symbol)
-            pip_gain = calc_pips(symbol, entry, current_price, direction)
-            closed = False
-            hit_message = None
+    for row in rows:
+        trade_id, symbol, direction, entry, sl, tp, tf, note, timestamp, status, pips_hit, message_id = row
+        current_price = fetch_live_price(symbol)
+        closed = False
+        hit_message = None
 
-            if direction.lower() == "buy":
-                if current_price >= tp:
-                    hit_message = f"🎯 *TP Hit* on {symbol} | +{pip_gain} pips"
-                    closed = True
-                elif current_price <= sl:
-                    hit_message = f"🛑 *SL Hit* on {symbol} | {pip_gain} pips"
-                    closed = True
-            elif direction.lower() == "sell":
-                if current_price <= tp:
-                    hit_message = f"🎯 *TP Hit* on {symbol} | +{pip_gain} pips"
-                    closed = True
-                elif current_price >= sl:
-                    hit_message = f"🛑 *SL Hit* on {symbol} | {pip_gain} pips"
-                    closed = True
+        if direction.lower() == "buy":
+            if current_price <= sl:
+                closed = True
+                hit_message = f"🛑 *SL Hit* on {symbol} | -{calc_pips(symbol, entry, sl, direction)} pips"
+            elif current_price >= tp:
+                closed = True
+                hit_message = f"🎯 *TP Hit* on {symbol} | +{calc_pips(symbol, entry, tp, direction)} pips"
 
-            if closed:
-                c.execute("UPDATE trades SET status = 'closed' WHERE id = ?", (trade_id,))
+        elif direction.lower() == "sell":
+            if current_price >= sl:
+                closed = True
+                hit_message = f"🛑 *SL Hit* on {symbol} | -{calc_pips(symbol, entry, sl, direction)} pips"
+            elif current_price <= tp:
+                closed = True
+                hit_message = f"🎯 *TP Hit* on {symbol} | +{calc_pips(symbol, entry, tp, direction)} pips"
+
+        if closed:
+            c.execute("UPDATE trades SET status = 'closed' WHERE id = ?", (trade_id,))
+            conn.commit()
+            send_telegram(hit_message)
+            continue
+
+        pip_gain = calc_pips(symbol, entry, current_price, direction)
+        for milestone in PIP_MILESTONES:
+            if pip_gain >= milestone and f"{milestone}" not in pips_hit.split(","):
+                send_telegram(f"📶 *{milestone} pips* reached on {symbol}")
+                updated = ",".join(filter(None, [pips_hit, str(milestone)]))
+                c.execute("UPDATE trades SET pips_hit = ? WHERE id = ?", (updated, trade_id))
                 conn.commit()
-                send_telegram(hit_message)
-                continue
 
-            for milestone in PIP_MILESTONES:
-                if pip_gain >= milestone and f"{milestone}" not in pips_hit.split(","):
-                    send_telegram(f"📶 *{milestone} pips* reached on {symbol}")
-                    updated = ",".join(filter(None, [pips_hit, str(milestone)]))
-                    c.execute("UPDATE trades SET pips_hit = ? WHERE id = ?", (updated, trade_id))
-                    conn.commit()
+    conn.close()
 
-        conn.close()
+# === HTML TABLE ===
+@app.route("/show-trades", methods=["GET"])
+def show_trades():
+    status_filter = request.args.get("status", None)
+    symbol_filter = request.args.get("symbol", None)
 
-# === CRON SETUP ===
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    query = "SELECT symbol, direction, entry, sl, tp, timeframe, timestamp, status, pips_hit FROM trades"
+    filters = []
+    params = []
+
+    if status_filter:
+        filters.append("status = ?")
+        params.append(status_filter.lower())
+    if symbol_filter:
+        filters.append("symbol = ?")
+        params.append(symbol_filter.upper())
+    if filters:
+        query += " WHERE " + " AND ".join(filters)
+
+    query += " ORDER BY id DESC"
+    c.execute(query, tuple(params))
+    rows = c.fetchall()
+    conn.close()
+
+    html = """
+    <html>
+    <head>
+        <title>Mr.Coprider Trades</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <style>
+            body { font-family: Arial; padding: 1em; background: #f4f4f4; }
+            table { width: 100%; border-collapse: collapse; background: #fff; }
+            th, td { padding: 10px; border: 1px solid #ccc; text-align: center; }
+            th { background-color: #222; color: #fff; }
+            tr:nth-child(even) { background: #f9f9f9; }
+            h2 { color: #333; }
+        </style>
+    </head>
+    <body>
+        <h2>📊 Mr.Coprider Bot Trade History</h2>
+        <p><b>Filters:</b> Add <code>?status=open</code> or <code>?symbol=XAUUSD</code> in URL</p>
+        <table>
+            <tr><th>Symbol</th><th>Dir</th><th>Entry</th><th>SL</th><th>TP</th><th>TF</th><th>Time</th><th>Status</th><th>Pips</th></tr>
+    """
+    for row in rows:
+        html += "<tr>" + "".join(f"<td>{cell}</td>" for cell in row) + "</tr>"
+    html += "</table></body></html>"
+    return html
+
+# === SCHEDULER ===
 scheduler = BackgroundScheduler()
-scheduler.add_job(func=poll_prices, trigger="interval", seconds=30)
+scheduler.add_job(poll_prices, "interval", seconds=30)
 scheduler.start()
 
 # === MAIN ===
