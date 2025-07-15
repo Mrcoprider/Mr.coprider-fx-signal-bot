@@ -4,6 +4,8 @@ import requests
 from datetime import datetime
 import pytz
 import random
+from apscheduler.schedulers.background import BackgroundScheduler
+import atexit
 
 app = Flask(__name__)
 
@@ -202,6 +204,12 @@ def poll_prices():
 
     conn.close()
     return jsonify({"message": "Polling complete"})
+
+# === AUTO POLL SETUP ===
+scheduler = BackgroundScheduler()
+scheduler.add_job(func=poll_prices, trigger="interval", seconds=30)
+scheduler.start()
+atexit.register(lambda: scheduler.shutdown())
 
 # === DOWNLOAD DATABASE FILE ===
 @app.route("/download-db", methods=["GET"])
