@@ -1,6 +1,7 @@
-flask
-requests
-pytz
-python-dotenv
-sqlite-utils
-apscheduler
+Flask==3.1.1
+requests==2.32.4
+pytz==2025.2
+python-dotenv==1.1.1
+sqlite-utils==3.38
+APScheduler==3.11.0
+tzlocal==5.3.1
