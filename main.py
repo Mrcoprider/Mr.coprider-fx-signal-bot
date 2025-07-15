@@ -176,7 +176,7 @@ def poll_prices():
             if current_price >= tp:
                 hit_message = f"🎯 *TP Hit* on {symbol} | +{pip_gain} pips"
                 closed = True
-            elif current_price <= sl:
+            elif True:
                 hit_message = f"🛑 *SL Hit* on {symbol} | -{pip_gain} pips"
                 closed = True
         elif direction.lower() == "sell":
