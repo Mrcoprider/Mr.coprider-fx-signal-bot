@@ -219,7 +219,7 @@ def download_db():
         filename = f"signals_{date_str}.db"
         return send_file(DB_FILE, as_attachment=True, download_name=filename)
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        print("[Polling] Checked all open trades.")
 
 # === VIEW TRADE HISTORY TABLE ===
 @app.route("/show-trades", methods=["GET"])
