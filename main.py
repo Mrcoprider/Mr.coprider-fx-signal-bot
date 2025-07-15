@@ -70,18 +70,14 @@ def round_price(value, symbol):
 
 def calc_pips(symbol, entry, price, direction):
     pip_size = 0.01 if any(x in symbol for x in ["JPY", "XAU", "XAG"]) else 0.0001
-    if direction.lower() == "buy":
-        return round((price - entry) / pip_size)
-    else:
-        return round((entry - price) / pip_size)
+    return round((price - entry) / pip_size) if direction.lower() == "buy" else round((entry - price) / pip_size)
 
-# === LIVE PRICE (Alpha Vantage) ===
+# === LIVE PRICE ===
 def fetch_live_price(symbol):
     fx_symbol = symbol.upper().replace("/", "")
     base = fx_symbol[:3]
     quote = fx_symbol[3:]
     url = f"https://www.alphavantage.co/query?function=CURRENCY_EXCHANGE_RATE&from_currency={base}&to_currency={quote}&apikey={ALPHA_VANTAGE_API_KEY}"
-
     try:
         response = requests.get(url, timeout=10).json()
         price = float(response["Realtime Currency Exchange Rate"]["5. Exchange Rate"])
@@ -102,14 +98,10 @@ def fetch_live_price(symbol):
 # === TELEGRAM ===
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": message,
-        "parse_mode": "Markdown"
-    }
+    payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "Markdown"}
     requests.post(url, json=payload)
 
-# === SIGNAL POSTING ===
+# === SIGNAL POST ===
 @app.route("/", methods=["POST"])
 def receive_signal():
     data = request.get_json()
@@ -149,7 +141,7 @@ TP: {tp}
     send_telegram(message)
     return jsonify({"message": "Signal posted"})
 
-# === POLL LOGIC ===
+# === POLL PRICES ===
 def poll_prices():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
@@ -159,24 +151,32 @@ def poll_prices():
     for row in rows:
         trade_id, symbol, direction, entry, sl, tp, tf, note, timestamp, status, pips_hit, message_id = row
         current_price = fetch_live_price(symbol)
+
+        print(f"[DEBUG] Trade ID {trade_id}: {symbol} | {direction.upper()} | Entry: {entry}, SL: {sl}, TP: {tp}, Live: {current_price}")
+
+        pip_gain = calc_pips(symbol, entry, current_price, direction)
+        print(f"[PIPS] {symbol} | {pip_gain} pips | Milestones hit: {pips_hit}")
         closed = False
         hit_message = None
 
         if direction.lower() == "buy":
-            if current_price <= sl:
+            if current_price >= tp:
+                hit_message = f"🎯 *TP Hit* on {symbol} | +{pip_gain} pips"
                 closed = True
-                hit_message = f"🛑 *SL Hit* on {symbol} | -{calc_pips(symbol, entry, sl, direction)} pips"
-            elif current_price >= tp:
+                print(f"[HIT] TP hit for BUY {symbol} at {current_price}")
+            elif current_price <= sl:
+                hit_message = f"🛑 *SL Hit* on {symbol} | -{pip_gain} pips"
                 closed = True
-                hit_message = f"🎯 *TP Hit* on {symbol} | +{calc_pips(symbol, entry, tp, direction)} pips"
-
+                print(f"[HIT] SL hit for BUY {symbol} at {current_price}")
         elif direction.lower() == "sell":
-            if current_price >= sl:
+            if current_price <= tp:
+                hit_message = f"🎯 *TP Hit* on {symbol} | +{pip_gain} pips"
                 closed = True
-                hit_message = f"🛑 *SL Hit* on {symbol} | -{calc_pips(symbol, entry, sl, direction)} pips"
-            elif current_price <= tp:
+                print(f"[HIT] TP hit for SELL {symbol} at {current_price}")
+            elif current_price >= sl:
+                hit_message = f"🛑 *SL Hit* on {symbol} | -{pip_gain} pips"
                 closed = True
-                hit_message = f"🎯 *TP Hit* on {symbol} | +{calc_pips(symbol, entry, tp, direction)} pips"
+                print(f"[HIT] SL hit for SELL {symbol} at {current_price}")
 
         if closed:
             c.execute("UPDATE trades SET status = 'closed' WHERE id = ?", (trade_id,))
@@ -184,7 +184,6 @@ def poll_prices():
             send_telegram(hit_message)
             continue
 
-        pip_gain = calc_pips(symbol, entry, current_price, direction)
         for milestone in PIP_MILESTONES:
             if pip_gain >= milestone and f"{milestone}" not in pips_hit.split(","):
                 send_telegram(f"📶 *{milestone} pips* reached on {symbol}")
@@ -194,12 +193,25 @@ def poll_prices():
 
     conn.close()
 
-# === HTML TABLE ===
+# === SCHEDULER ===
+scheduler = BackgroundScheduler()
+scheduler.add_job(poll_prices, 'interval', seconds=30)
+scheduler.start()
+
+# === ROUTES ===
+@app.route("/download-db", methods=["GET"])
+def download_db():
+    try:
+        date_str = datetime.now().strftime("%d-%b-%Y")
+        filename = f"signals_{date_str}.db"
+        return send_file(DB_FILE, as_attachment=True, download_name=filename)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/show-trades", methods=["GET"])
 def show_trades():
     status_filter = request.args.get("status", None)
     symbol_filter = request.args.get("symbol", None)
-
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     query = "SELECT symbol, direction, entry, sl, tp, timeframe, timestamp, status, pips_hit FROM trades"
@@ -221,34 +233,24 @@ def show_trades():
     conn.close()
 
     html = """
-    <html>
-    <head>
-        <title>Mr.Coprider Trades</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <style>
-            body { font-family: Arial; padding: 1em; background: #f4f4f4; }
-            table { width: 100%; border-collapse: collapse; background: #fff; }
-            th, td { padding: 10px; border: 1px solid #ccc; text-align: center; }
-            th { background-color: #222; color: #fff; }
-            tr:nth-child(even) { background: #f9f9f9; }
-            h2 { color: #333; }
-        </style>
-    </head>
-    <body>
-        <h2>📊 Mr.Coprider Bot Trade History</h2>
-        <p><b>Filters:</b> Add <code>?status=open</code> or <code>?symbol=XAUUSD</code> in URL</p>
-        <table>
-            <tr><th>Symbol</th><th>Dir</th><th>Entry</th><th>SL</th><th>TP</th><th>TF</th><th>Time</th><th>Status</th><th>Pips</th></tr>
+    <html><head><title>Mr.Coprider Trades</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+    body { font-family: Arial; padding: 1em; background: #f4f4f4; }
+    table { width: 100%; border-collapse: collapse; background: #fff; }
+    th, td { padding: 10px; border: 1px solid #ccc; text-align: center; }
+    th { background-color: #222; color: #fff; }
+    tr:nth-child(even) { background: #f9f9f9; }
+    </style></head><body>
+    <h2>📊 Mr.Coprider Bot Trade History</h2>
+    <p><b>Filters:</b> Add <code>?status=open</code> or <code>?symbol=XAUUSD</code> in URL</p>
+    <table>
+    <tr><th>Symbol</th><th>Dir</th><th>Entry</th><th>SL</th><th>TP</th><th>TF</th><th>Time</th><th>Status</th><th>Pips</th></tr>
     """
     for row in rows:
         html += "<tr>" + "".join(f"<td>{cell}</td>" for cell in row) + "</tr>"
     html += "</table></body></html>"
     return html
-
-# === SCHEDULER ===
-scheduler = BackgroundScheduler()
-scheduler.add_job(poll_prices, "interval", seconds=30)
-scheduler.start()
 
 # === MAIN ===
 if __name__ == "__main__":
