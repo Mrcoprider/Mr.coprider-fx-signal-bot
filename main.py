@@ -5,7 +5,6 @@ from datetime import datetime
 import pytz
 import random
 from apscheduler.schedulers.background import BackgroundScheduler
-import atexit
 
 app = Flask(__name__)
 
@@ -39,18 +38,7 @@ def init_db():
     conn.commit()
     conn.close()
 
-def ensure_message_id_column():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    try:
-        c.execute("ALTER TABLE trades ADD COLUMN message_id INTEGER")
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass
-    conn.close()
-
 init_db()
-ensure_message_id_column()
 
 # === FORMATTERS ===
 def format_tf(tf):
@@ -84,29 +72,25 @@ def calc_pips(symbol, entry, price):
     pip_size = 0.01 if any(x in symbol for x in ["JPY", "XAU", "XAG"]) else 0.0001
     return round(abs(price - entry) / pip_size)
 
-# === LIVE PRICE (Alpha Vantage) ===
+# === LIVE PRICE ===
 def fetch_live_price(symbol):
     fx_symbol = symbol.upper().replace("/", "")
     base = fx_symbol[:3]
     quote = fx_symbol[3:]
-
     url = f"https://www.alphavantage.co/query?function=CURRENCY_EXCHANGE_RATE&from_currency={base}&to_currency={quote}&apikey={ALPHA_VANTAGE_API_KEY}"
 
     try:
         response = requests.get(url, timeout=10).json()
         price = float(response["Realtime Currency Exchange Rate"]["5. Exchange Rate"])
         return round(price, 5)
-    except Exception as e:
-        print(f"[AlphaVantage Fallback] Error: {e}")
+    except:
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
         c.execute("SELECT entry FROM trades WHERE symbol = ? ORDER BY id DESC LIMIT 1", (symbol,))
         result = c.fetchone()
         conn.close()
         if result:
-            base_price = result[0]
-            variation = random.uniform(-0.005, 0.005)
-            return round(base_price + variation, 5)
+            return round(result[0] + random.uniform(-0.005, 0.005), 5)
         return 0
 
 # === TELEGRAM ===
@@ -119,7 +103,7 @@ def send_telegram(message):
     }
     requests.post(url, json=payload)
 
-# === SIGNAL POSTING ROUTE ===
+# === SIGNAL POST ===
 @app.route("/", methods=["POST"])
 def receive_signal():
     data = request.get_json()
@@ -159,9 +143,14 @@ TP: {tp}
     send_telegram(message)
     return jsonify({"message": "Signal posted"})
 
-# === POLL SL/TP & PIPS TRACKING ===
+# === MANUAL POLL ROUTE ===
 @app.route("/poll", methods=["GET"])
 def poll_prices():
+    poll_job()
+    return jsonify({"message": "Manual polling complete"})
+
+# === BACKGROUND POLLING JOB ===
+def poll_job():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("SELECT * FROM trades WHERE status = 'open'")
@@ -203,15 +192,9 @@ def poll_prices():
                 conn.commit()
 
     conn.close()
-    return jsonify({"message": "Polling complete"})
+    print("[Polling] Checked all open trades.")
 
-# === AUTO POLL SETUP ===
-scheduler = BackgroundScheduler()
-scheduler.add_job(func=poll_prices, trigger="interval", seconds=30)
-scheduler.start()
-atexit.register(lambda: scheduler.shutdown())
-
-# === DOWNLOAD DATABASE FILE ===
+# === DB DOWNLOAD ===
 @app.route("/download-db", methods=["GET"])
 def download_db():
     try:
@@ -219,9 +202,9 @@ def download_db():
         filename = f"signals_{date_str}.db"
         return send_file(DB_FILE, as_attachment=True, download_name=filename)
     except Exception as e:
-        print("[Polling] Checked all open trades.")
+        return jsonify({"error": str(e)}), 500
 
-# === VIEW TRADE HISTORY TABLE ===
+# === TRADE HISTORY TABLE ===
 @app.route("/show-trades", methods=["GET"])
 def show_trades():
     status_filter = request.args.get("status", None)
@@ -272,18 +255,10 @@ def show_trades():
     html += "</table></body></html>"
     return html
 
-# === MIGRATION ROUTE (optional) ===
-@app.route("/migrate-add-message-id", methods=["GET"])
-def migrate_add_message_id():
-    try:
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("ALTER TABLE trades ADD COLUMN message_id INTEGER")
-        conn.commit()
-        conn.close()
-        return "✅ Migration successful: `message_id` column added."
-    except Exception as e:
-        return f"⚠️ Migration error: {str(e)}"
+# === SCHEDULER ===
+scheduler = BackgroundScheduler()
+scheduler.add_job(poll_job, "interval", seconds=30)
+scheduler.start()
 
 # === MAIN ===
 if __name__ == "__main__":
