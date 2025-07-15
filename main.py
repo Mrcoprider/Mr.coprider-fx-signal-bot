@@ -38,7 +38,18 @@ def init_db():
     conn.commit()
     conn.close()
 
+def ensure_message_id_column():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    try:
+        c.execute("ALTER TABLE trades ADD COLUMN message_id INTEGER")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    conn.close()
+
 init_db()
+ensure_message_id_column()
 
 # === FORMATTERS ===
 def format_tf(tf):
@@ -68,11 +79,14 @@ def round_price(value, symbol):
         return round(value, 2)
     return round(value, 5)
 
-def calc_pips(symbol, entry, price):
+def calc_pips(symbol, entry, price, direction):
     pip_size = 0.01 if any(x in symbol for x in ["JPY", "XAU", "XAG"]) else 0.0001
-    return round(abs(price - entry) / pip_size)
+    if direction.lower() == "buy":
+        return round((price - entry) / pip_size)
+    else:
+        return round((entry - price) / pip_size)
 
-# === LIVE PRICE (Alpha Vantage) ===
+# === LIVE PRICE ===
 def fetch_live_price(symbol):
     fx_symbol = symbol.upper().replace("/", "")
     base = fx_symbol[:3]
@@ -107,7 +121,7 @@ def send_telegram(message):
     }
     requests.post(url, json=payload)
 
-# === RECEIVE SIGNAL ===
+# === SIGNAL POSTING ===
 @app.route("/", methods=["POST"])
 def receive_signal():
     data = request.get_json()
@@ -124,26 +138,6 @@ def receive_signal():
 
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-
-    # === FILTER DUPLICATES & TIME SPAM ===
-    c.execute('''
-        SELECT timestamp FROM trades
-        WHERE symbol = ? AND direction = ? AND timeframe = ? AND status = 'open'
-        ORDER BY id DESC LIMIT 1
-    ''', (symbol, direction, tf))
-    row = c.fetchone()
-
-    if row:
-        try:
-            last_time = datetime.strptime(row[0], "%d-%b-%Y %I:%M %p")
-            now_ist = datetime.now(pytz.timezone("Asia/Kolkata"))
-            minutes_diff = (now_ist - last_time).total_seconds() / 60
-            if minutes_diff < 15:
-                conn.close()
-                return jsonify({"message": f"Duplicate signal skipped: {symbol} {direction} ({tf}) <15min"})
-        except:
-            pass
-
     c.execute('''
         INSERT INTO trades (symbol, direction, entry, sl, tp, timeframe, note, timestamp)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -167,7 +161,7 @@ TP: {tp}
     send_telegram(message)
     return jsonify({"message": "Signal posted"})
 
-# === POLLING ROUTE ===
+# === POLLING LOGIC ===
 def poll_prices():
     with app.app_context():
         conn = sqlite3.connect(DB_FILE)
@@ -178,7 +172,7 @@ def poll_prices():
         for row in rows:
             trade_id, symbol, direction, entry, sl, tp, tf, note, timestamp, status, pips_hit, message_id = row
             current_price = fetch_live_price(symbol)
-            pip_gain = calc_pips(symbol, entry, current_price)
+            pip_gain = calc_pips(symbol, entry, current_price, direction)
             closed = False
             hit_message = None
 
@@ -187,14 +181,14 @@ def poll_prices():
                     hit_message = f"🎯 *TP Hit* on {symbol} | +{pip_gain} pips"
                     closed = True
                 elif current_price <= sl:
-                    hit_message = f"🛑 *SL Hit* on {symbol} | -{pip_gain} pips"
+                    hit_message = f"🛑 *SL Hit* on {symbol} | {pip_gain} pips"
                     closed = True
             elif direction.lower() == "sell":
                 if current_price <= tp:
                     hit_message = f"🎯 *TP Hit* on {symbol} | +{pip_gain} pips"
                     closed = True
                 elif current_price >= sl:
-                    hit_message = f"🛑 *SL Hit* on {symbol} | -{pip_gain} pips"
+                    hit_message = f"🛑 *SL Hit* on {symbol} | {pip_gain} pips"
                     closed = True
 
             if closed:
@@ -212,70 +206,9 @@ def poll_prices():
 
         conn.close()
 
-# === DB DOWNLOAD ===
-@app.route("/download-db", methods=["GET"])
-def download_db():
-    try:
-        date_str = datetime.now().strftime("%d-%b-%Y")
-        filename = f"signals_{date_str}.db"
-        return send_file(DB_FILE, as_attachment=True, download_name=filename)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-# === VIEW TRADES ===
-@app.route("/show-trades", methods=["GET"])
-def show_trades():
-    status_filter = request.args.get("status", None)
-    symbol_filter = request.args.get("symbol", None)
-
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    query = "SELECT symbol, direction, entry, sl, tp, timeframe, timestamp, status, pips_hit FROM trades"
-    filters = []
-    params = []
-
-    if status_filter:
-        filters.append("status = ?")
-        params.append(status_filter.lower())
-    if symbol_filter:
-        filters.append("symbol = ?")
-        params.append(symbol_filter.upper())
-    if filters:
-        query += " WHERE " + " AND ".join(filters)
-
-    query += " ORDER BY id DESC"
-    c.execute(query, tuple(params))
-    rows = c.fetchall()
-    conn.close()
-
-    html = """
-    <html>
-    <head>
-        <title>Mr.Coprider Trades</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <style>
-            body { font-family: Arial; padding: 1em; background: #f4f4f4; }
-            table { width: 100%; border-collapse: collapse; background: #fff; }
-            th, td { padding: 10px; border: 1px solid #ccc; text-align: center; }
-            th { background-color: #222; color: #fff; }
-            tr:nth-child(even) { background: #f9f9f9; }
-            h2 { color: #333; }
-        </style>
-    </head>
-    <body>
-        <h2>📊 Mr.Coprider Bot Trade History</h2>
-        <p><b>Filters:</b> Add <code>?status=open</code> or <code>?symbol=XAUUSD</code> in URL</p>
-        <table>
-            <tr><th>Symbol</th><th>Dir</th><th>Entry</th><th>SL</th><th>TP</th><th>TF</th><th>Time</th><th>Status</th><th>Pips</th></tr>
-    """
-    for row in rows:
-        html += "<tr>" + "".join(f"<td>{cell}</td>" for cell in row) + "</tr>"
-    html += "</table></body></html>"
-    return html
-
-# === SCHEDULER ===
+# === CRON SETUP ===
 scheduler = BackgroundScheduler()
-scheduler.add_job(poll_prices, 'interval', seconds=30)
+scheduler.add_job(func=poll_prices, trigger="interval", seconds=30)
 scheduler.start()
 
 # === MAIN ===
