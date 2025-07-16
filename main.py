@@ -1,10 +1,12 @@
 from flask import Flask, request, jsonify, send_file
 import sqlite3
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime
 import pytz
 import random
 from apscheduler.schedulers.background import BackgroundScheduler
+import threading
+import time
 
 app = Flask(__name__)
 
@@ -30,9 +32,8 @@ def init_db():
             note TEXT,
             timestamp TEXT,
             status TEXT DEFAULT 'open',
-            pips_hit TEXT DEFAULT '',
             message_id INTEGER,
-            entry_time_utc TEXT
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     ''')
     conn.commit()
@@ -68,8 +69,18 @@ def round_price(value, symbol):
         return round(value, 2)
     return round(value, 5)
 
+def detect_pip_size(symbol):
+    symbol = symbol.upper()
+    if "XAU" in symbol:
+        return 0.10
+    if any(s in symbol for s in ["JPY", "XAG"]):
+        return 0.01
+    if any(s in symbol for s in ["BTC", "ETH", "US30", "NAS", "GER", "IND", "NIFTY", "BANKNIFTY", "SENSEX"]):
+        return 1
+    return 0.0001  # Default FX
+
 def calc_pips(symbol, entry, price, direction):
-    pip_size = 0.01 if any(x in symbol for x in ["JPY", "XAU", "XAG"]) else 0.0001
+    pip_size = detect_pip_size(symbol)
     return round((price - entry) / pip_size) if direction.lower() == "buy" else round((entry - price) / pip_size)
 
 # === LIVE PRICE ===
@@ -82,7 +93,8 @@ def fetch_live_price(symbol):
         response = requests.get(url, timeout=10).json()
         price = float(response["Realtime Currency Exchange Rate"]["5. Exchange Rate"])
         return round(price, 5)
-    except:
+    except Exception as e:
+        print(f"[AlphaVantage Fallback] Error: {e}")
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
         c.execute("SELECT entry FROM trades WHERE symbol = ? ORDER BY id DESC LIMIT 1", (symbol,))
@@ -115,14 +127,12 @@ def receive_signal():
     timestamp_raw = data.get("timestamp", "")
     timestamp = format_time_ist(timestamp_raw)
 
-    entry_time_utc = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute('''
-        INSERT INTO trades (symbol, direction, entry, sl, tp, timeframe, note, timestamp, entry_time_utc)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (symbol, direction, entry, sl, tp, tf, note, timestamp, entry_time_utc))
+        INSERT INTO trades (symbol, direction, entry, sl, tp, timeframe, note, timestamp)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (symbol, direction, entry, sl, tp, tf, note, timestamp))
     conn.commit()
     conn.close()
 
@@ -138,7 +148,6 @@ TP: {tp}
 🕐 {timestamp}
 📝 {note}
 """.strip()
-
     send_telegram(message)
     return jsonify({"message": "Signal posted"})
 
@@ -150,51 +159,39 @@ def poll_prices():
     rows = c.fetchall()
 
     for row in rows:
-        trade_id, symbol, direction, entry, sl, tp, tf, note, timestamp, status, pips_hit, message_id, entry_time_utc = row
+        trade_id, symbol, direction, entry, sl, tp, tf, note, timestamp, status, message_id, created_at = row
         current_price = fetch_live_price(symbol)
         pip_gain = calc_pips(symbol, entry, current_price, direction)
+
+        # === TP / SL Hit Check ===
+        hit_msg = None
         closed = False
-        hit_message = None
 
         if direction.lower() == "buy":
             if current_price >= tp:
-                hit_message = f"🎯 *TP Hit* on {symbol} | +{pip_gain} pips"
+                hit_msg = f"🎯 *TP Hit* on {symbol} | +{pip_gain} pips"
                 closed = True
             elif current_price <= sl:
-                hit_message = f"🛑 *SL Hit* on {symbol} | -{abs(pip_gain)} pips"
+                hit_msg = f"🛑 *SL Hit* on {symbol} | {pip_gain} pips"
                 closed = True
-        elif direction.lower() == "sell":
+        else:
             if current_price <= tp:
-                hit_message = f"🎯 *TP Hit* on {symbol} | +{pip_gain} pips"
+                hit_msg = f"🎯 *TP Hit* on {symbol} | +{pip_gain} pips"
                 closed = True
             elif current_price >= sl:
-                hit_message = f"🛑 *SL Hit* on {symbol} | -{abs(pip_gain)} pips"
+                hit_msg = f"🛑 *SL Hit* on {symbol} | {pip_gain} pips"
                 closed = True
 
         if closed:
             c.execute("UPDATE trades SET status = 'closed' WHERE id = ?", (trade_id,))
             conn.commit()
-            send_telegram(hit_message)
-            continue
+            send_telegram(hit_msg)
 
-        if entry_time_utc:
-            try:
-                entry_dt = datetime.strptime(entry_time_utc, "%Y-%m-%dT%H:%M:%SZ")
-                now_utc = datetime.utcnow()
-                delta = now_utc - entry_dt
-
-                if delta.total_seconds() >= 900 and "15" not in pips_hit:
-                    send_telegram(f"⏱️ 15-mins Update on {symbol} | Current PnL: {pip_gain} pips (from entry: {entry})")
-                    c.execute("UPDATE trades SET pips_hit = ? WHERE id = ?", (pips_hit + ",15", trade_id))
-                    conn.commit()
-
-                if delta.total_seconds() >= 1800 and "30" not in pips_hit:
-                    send_telegram(f"⏱️ 30-mins Update on {symbol} | Current PnL: {pip_gain} pips (from entry: {entry})")
-                    c.execute("UPDATE trades SET pips_hit = ? WHERE id = ?", (pips_hit + ",30", trade_id))
-                    conn.commit()
-
-            except Exception as e:
-                print(f"[TimeCheck] Error: {e}")
+        # === Real-Time Update at 15 & 30 mins ===
+        time_diff = (datetime.utcnow() - datetime.strptime(created_at, "%Y-%m-%d %H:%M:%S")).total_seconds() / 60
+        if 14 < time_diff < 16 or 29 < time_diff < 31:
+            update_msg = f"⏱️ *{int(time_diff)}-mins Update* on {symbol} | Pips gain so far: {pip_gain} (from entry: {entry})"
+            send_telegram(update_msg)
 
     conn.close()
 
@@ -207,8 +204,7 @@ scheduler.start()
 @app.route("/download-db", methods=["GET"])
 def download_db():
     try:
-        date_str = datetime.now().strftime("%d-%b-%Y")
-        filename = f"signals_{date_str}.db"
+        filename = f"signals_{datetime.now().strftime('%d-%b-%Y')}.db"
         return send_file(DB_FILE, as_attachment=True, download_name=filename)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -219,7 +215,7 @@ def show_trades():
     symbol_filter = request.args.get("symbol", None)
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    query = "SELECT symbol, direction, entry, sl, tp, timeframe, timestamp, status, pips_hit FROM trades"
+    query = "SELECT symbol, direction, entry, sl, tp, timeframe, timestamp, status FROM trades"
     filters = []
     params = []
 
@@ -250,7 +246,7 @@ def show_trades():
     <h2>📊 Mr.Coprider Bot Trade History</h2>
     <p><b>Filters:</b> Add <code>?status=open</code> or <code>?symbol=XAUUSD</code> in URL</p>
     <table>
-    <tr><th>Symbol</th><th>Dir</th><th>Entry</th><th>SL</th><th>TP</th><th>TF</th><th>Time</th><th>Status</th><th>Pips</th></tr>
+    <tr><th>Symbol</th><th>Dir</th><th>Entry</th><th>SL</th><th>TP</th><th>TF</th><th>Time</th><th>Status</th></tr>
     """
     for row in rows:
         html += "<tr>" + "".join(f"<td>{cell}</td>" for cell in row) + "</tr>"
