@@ -5,8 +5,6 @@ from datetime import datetime
 import pytz
 import random
 from apscheduler.schedulers.background import BackgroundScheduler
-import threading
-import time
 
 app = Flask(__name__)
 
@@ -32,8 +30,7 @@ def init_db():
             note TEXT,
             timestamp TEXT,
             status TEXT DEFAULT 'open',
-            message_id INTEGER,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            message_id INTEGER
         )
     ''')
     conn.commit()
@@ -69,19 +66,20 @@ def round_price(value, symbol):
         return round(value, 2)
     return round(value, 5)
 
-def detect_pip_size(symbol):
-    symbol = symbol.upper()
-    if "XAU" in symbol:
-        return 0.10
-    if any(s in symbol for s in ["JPY", "XAG"]):
-        return 0.01
-    if any(s in symbol for s in ["BTC", "ETH", "US30", "NAS", "GER", "IND", "NIFTY", "BANKNIFTY", "SENSEX"]):
-        return 1
-    return 0.0001  # Default FX
-
 def calc_pips(symbol, entry, price, direction):
-    pip_size = detect_pip_size(symbol)
-    return round((price - entry) / pip_size) if direction.lower() == "buy" else round((entry - price) / pip_size)
+    symbol = symbol.upper()
+    if any(x in symbol for x in ["XAU", "XAG"]):
+        pip_size = 0.1  # 1.0 = 10 pips for metals
+    elif "JPY" in symbol:
+        pip_size = 0.01
+    elif any(x in symbol for x in ["US30", "NAS", "GER", "IND"]):
+        pip_size = 1
+    elif any(x in symbol for x in ["BTC", "ETH"]):
+        pip_size = 1
+    else:
+        pip_size = 0.0001
+    raw_pips = (price - entry) if direction.lower() == "buy" else (entry - price)
+    return round(raw_pips / pip_size)
 
 # === LIVE PRICE ===
 def fetch_live_price(symbol):
@@ -148,10 +146,11 @@ TP: {tp}
 🕐 {timestamp}
 📝 {note}
 """.strip()
+
     send_telegram(message)
     return jsonify({"message": "Signal posted"})
 
-# === POLL PRICES ===
+# === SCHEDULER ===
 def poll_prices():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
@@ -159,100 +158,39 @@ def poll_prices():
     rows = c.fetchall()
 
     for row in rows:
-        trade_id, symbol, direction, entry, sl, tp, tf, note, timestamp, status, message_id, created_at = row
+        trade_id, symbol, direction, entry, sl, tp, tf, note, timestamp, status, message_id = row
         current_price = fetch_live_price(symbol)
         pip_gain = calc_pips(symbol, entry, current_price, direction)
 
-        # === TP / SL Hit Check ===
-        hit_msg = None
         closed = False
+        hit_message = None
 
         if direction.lower() == "buy":
             if current_price >= tp:
-                hit_msg = f"🎯 *TP Hit* on {symbol} | +{pip_gain} pips"
+                hit_message = f"🎯 *TP Hit* on {symbol} | +{pip_gain} pips"
                 closed = True
             elif current_price <= sl:
-                hit_msg = f"🛑 *SL Hit* on {symbol} | {pip_gain} pips"
+                hit_message = f"🛑 *SL Hit* on {symbol} | -{pip_gain} pips"
                 closed = True
-        else:
+        elif direction.lower() == "sell":
             if current_price <= tp:
-                hit_msg = f"🎯 *TP Hit* on {symbol} | +{pip_gain} pips"
+                hit_message = f"🎯 *TP Hit* on {symbol} | +{pip_gain} pips"
                 closed = True
             elif current_price >= sl:
-                hit_msg = f"🛑 *SL Hit* on {symbol} | {pip_gain} pips"
+                hit_message = f"🛑 *SL Hit* on {symbol} | -{pip_gain} pips"
                 closed = True
 
         if closed:
             c.execute("UPDATE trades SET status = 'closed' WHERE id = ?", (trade_id,))
             conn.commit()
-            send_telegram(hit_msg)
-
-        # === Real-Time Update at 15 & 30 mins ===
-        time_diff = (datetime.utcnow() - datetime.strptime(created_at, "%Y-%m-%d %H:%M:%S")).total_seconds() / 60
-        if 14 < time_diff < 16 or 29 < time_diff < 31:
-            update_msg = f"⏱️ *{int(time_diff)}-mins Update* on {symbol} | Pips gain so far: {pip_gain} (from entry: {entry})"
-            send_telegram(update_msg)
+            send_telegram(hit_message)
 
     conn.close()
 
-# === SCHEDULER ===
 scheduler = BackgroundScheduler()
 scheduler.add_job(poll_prices, 'interval', seconds=30)
 scheduler.start()
 
-# === ROUTES ===
-@app.route("/download-db", methods=["GET"])
-def download_db():
-    try:
-        filename = f"signals_{datetime.now().strftime('%d-%b-%Y')}.db"
-        return send_file(DB_FILE, as_attachment=True, download_name=filename)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route("/show-trades", methods=["GET"])
-def show_trades():
-    status_filter = request.args.get("status", None)
-    symbol_filter = request.args.get("symbol", None)
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    query = "SELECT symbol, direction, entry, sl, tp, timeframe, timestamp, status FROM trades"
-    filters = []
-    params = []
-
-    if status_filter:
-        filters.append("status = ?")
-        params.append(status_filter.lower())
-    if symbol_filter:
-        filters.append("symbol = ?")
-        params.append(symbol_filter.upper())
-    if filters:
-        query += " WHERE " + " AND ".join(filters)
-
-    query += " ORDER BY id DESC"
-    c.execute(query, tuple(params))
-    rows = c.fetchall()
-    conn.close()
-
-    html = """
-    <html><head><title>Mr.Coprider Trades</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <style>
-    body { font-family: Arial; padding: 1em; background: #f4f4f4; }
-    table { width: 100%; border-collapse: collapse; background: #fff; }
-    th, td { padding: 10px; border: 1px solid #ccc; text-align: center; }
-    th { background-color: #222; color: #fff; }
-    tr:nth-child(even) { background: #f9f9f9; }
-    </style></head><body>
-    <h2>📊 Mr.Coprider Bot Trade History</h2>
-    <p><b>Filters:</b> Add <code>?status=open</code> or <code>?symbol=XAUUSD</code> in URL</p>
-    <table>
-    <tr><th>Symbol</th><th>Dir</th><th>Entry</th><th>SL</th><th>TP</th><th>TF</th><th>Time</th><th>Status</th></tr>
-    """
-    for row in rows:
-        html += "<tr>" + "".join(f"<td>{cell}</td>" for cell in row) + "</tr>"
-    html += "</table></body></html>"
-    return html
-
-# === MAIN ===
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
+    
