@@ -20,22 +20,22 @@ def init_db():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute('''
-        CREATE TABLE IF NOT EXISTS trades (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            symbol TEXT,
-            direction TEXT,
-            entry REAL,
-            sl REAL,
-            tp REAL,
-            timeframe TEXT,
-            note TEXT,
-            timestamp TEXT,
-            status TEXT DEFAULT 'open',
-            alerted_15 INTEGER DEFAULT 0,
-            alerted_30 INTEGER DEFAULT 0,
-            hit_milestones TEXT DEFAULT '',
-            message_id INTEGER
-        )
+    CREATE TABLE IF NOT EXISTS trades (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT,
+        direction TEXT,
+        entry REAL,
+        sl REAL,
+        tp REAL,
+        timeframe TEXT,
+        note TEXT,
+        timestamp TEXT,
+        status TEXT DEFAULT 'open',
+        alerted_15 INTEGER DEFAULT 0,
+        alerted_30 INTEGER DEFAULT 0,
+        hit_milestones TEXT DEFAULT '',
+        message_id INTEGER
+    )
     ''')
     conn.commit()
     conn.close()
@@ -47,11 +47,8 @@ def format_tf(tf):
     tf = tf.upper()
     return {
         "1": "1M", "3": "3M", "5": "5M", "15": "15M", "30": "30M",
-        "60": "H1", "1H": "H1",
-        "120": "H2", "2H": "H2",
-        "240": "H4", "4H": "H4",
-        "D": "Daily", "1D": "Daily",
-        "W": "Weekly", "1W": "Weekly",
+        "60": "H1", "1H": "H1", "120": "H2", "2H": "H2", "240": "H4", "4H": "H4",
+        "D": "Daily", "1D": "Daily", "W": "Weekly", "1W": "Weekly",
         "M": "Monthly", "1M": "Monthly"
     }.get(tf, tf)
 
@@ -75,12 +72,10 @@ def calc_pips(symbol, entry, price, direction):
     if "JPY" in symbol:
         return round(diff / 0.01)
     elif "XAU" in symbol:
-        return round(diff / 0.1)  # 10 pips = 1.0
+        return round(diff / 0.1)
     elif "XAG" in symbol:
         return round(diff / 0.01)
-    elif any(x in symbol for x in ["BTC", "ETH"]):
-        return round(diff)
-    elif any(x in symbol for x in ["US30", "NAS", "GER", "IND", "NIFTY"]):
+    elif any(x in symbol for x in ["BTC", "ETH", "US30", "NAS", "GER", "IND", "NIFTY"]):
         return round(diff)
     else:
         return round(diff / 0.0001)
@@ -101,6 +96,9 @@ def send_telegram(text):
     r = requests.post(url, json=payload).json()
     return r.get("result", {}).get("message_id")
 
+def get_chart_image_url(symbol, tf):
+    return f"https://www.tradingview.com/chart/?symbol={symbol}&interval={tf}"
+
 # === SIGNAL RECEIVE ===
 @app.route("/", methods=["POST"])
 def webhook():
@@ -115,6 +113,7 @@ def webhook():
     note = data.get("note", "Mr.CopriderBot Signal")
     raw_time = data.get("timestamp", "")
     time_ist = format_time_ist(raw_time)
+    chart_link = get_chart_image_url(symbol, tf_raw)
 
     msg = f"""
 📡 Mr.Coprider Bot Signal
@@ -126,6 +125,7 @@ SL: {sl}
 TP: {tp}
 🕐 {time_ist}
 📝 {note}
+📸 [View Chart]({chart_link})
 """.strip()
 
     msg_id = send_telegram(msg)
@@ -138,7 +138,6 @@ TP: {tp}
     ''', (symbol, direction, entry, sl, tp, tf, note, raw_time, msg_id))
     conn.commit()
     conn.close()
-
     return jsonify({"msg": "received"})
 
 # === PRICE CHECK ===
@@ -154,8 +153,9 @@ def poll():
         live = fetch_live_price(symbol)
         if live == 0: continue
         pips = calc_pips(symbol, entry, live, direction)
+        tp_progress = round((abs(pips) / abs(calc_pips(symbol, entry, tp, direction))) * 100, 1)
+        progress_text = f"🎯 TP Progress: {tp_progress}%"
 
-        # === SL / TP Check ===
         tp_hit = live >= tp if direction == "buy" else live <= tp
         sl_hit = live <= sl if direction == "buy" else live >= sl
 
@@ -167,34 +167,63 @@ def poll():
             conn.commit()
             continue
 
-        # === Real-Time Milestones ===
         for level in PIP_MILESTONES:
             if abs(pips) >= level and str(level) not in hit.split(","):
-                milestone_msg = f"📶 {symbol} | {level} pips gained so far\nhttps://t.me/Mr_CopriderFx/{msg_id}"
+                milestone_msg = f"📶 {symbol} | {level} pips gained so far\n{progress_text}\nhttps://t.me/Mr_CopriderFx/{msg_id}"
                 send_telegram(milestone_msg)
                 new_hits = f"{hit},{level}" if hit else str(level)
                 c.execute("UPDATE trades SET hit_milestones=? WHERE id=?", (new_hits, id))
                 conn.commit()
 
-        # === Timed PnL Update ===
+        if abs(pips) >= 100 and "TSL" not in hit:
+            new_sl = entry
+            if abs(pips) >= 150:
+                new_sl += 0.0005 if direction == "buy" else -0.0005
+            tsl_msg = f"🔄 Trailing SL updated on {symbol}\nNew SL: {round_price(new_sl, symbol)}\n{progress_text}"
+            send_telegram(tsl_msg)
+            c.execute("UPDATE trades SET hit_milestones=? WHERE id=?", (hit + ",TSL", id))
+            conn.commit()
+
         entry_time = datetime.strptime(ts_raw, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=pytz.UTC).astimezone(pytz.timezone("Asia/Kolkata"))
         mins = (now - entry_time).total_seconds() / 60
 
         if mins >= 15 and not a15:
-            send_telegram(f"⏱️ 15-mins Update on {symbol} | Pips gain so far: {pips:+} (from entry: {entry})\nhttps://t.me/Mr_CopriderFx/{msg_id}")
+            send_telegram(f"⏱️ 15-mins Update on {symbol} | Pips: {pips:+}\n{progress_text}\nhttps://t.me/Mr_CopriderFx/{msg_id}")
             c.execute("UPDATE trades SET alerted_15=1 WHERE id=?", (id,))
             conn.commit()
 
         if mins >= 30 and not a30:
-            send_telegram(f"⏱️ 30-mins Update on {symbol} | Pips gain so far: {pips:+} (from entry: {entry})\nhttps://t.me/Mr_CopriderFx/{msg_id}")
+            send_telegram(f"⏱️ 30-mins Update on {symbol} | Pips: {pips:+}\n{progress_text}\nhttps://t.me/Mr_CopriderFx/{msg_id}")
             c.execute("UPDATE trades SET alerted_30=1 WHERE id=?", (id,))
             conn.commit()
 
     conn.close()
 
+# === SUMMARY REPORTS ===
+def send_summary_report():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    today = datetime.now().strftime('%Y-%m-%d')
+    c.execute("SELECT status FROM trades WHERE date(timestamp) = ?", (today,))
+    rows = c.fetchall()
+    total = len(rows)
+    tp = sum(1 for r in rows if r[0] == 'closed')
+    sl = total - tp
+    win = round((tp / total) * 100, 1) if total else 0
+    msg = f"""
+📅 *Daily Summary*
+✅ Signals: {total}
+🎯 TP: {tp}
+❌ SL: {sl}
+📊 Win Rate: {win}%
+    """.strip()
+    send_telegram(msg)
+    conn.close()
+
 # === SCHEDULER ===
 scheduler = BackgroundScheduler()
 scheduler.add_job(poll, "interval", seconds=30)
+scheduler.add_job(send_summary_report, "cron", hour=23, minute=59)
 scheduler.start()
 
 # === DOWNLOAD DB ===
