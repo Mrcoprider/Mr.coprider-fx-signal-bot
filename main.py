@@ -92,6 +92,10 @@ def save_trade(data, msg_id):
     conn.close()
 
 def is_duplicate_signal(data):
+    ist = pytz.timezone("Asia/Kolkata")
+    now_ist = datetime.now(ist)
+    window_start = now_ist - timedelta(seconds=30)
+
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("""
@@ -100,7 +104,7 @@ def is_duplicate_signal(data):
     """, (
         data['symbol'], data['direction'], data['entry'],
         data['sl'], data['tp'], data['timeframe'],
-        (datetime.utcnow() - timedelta(seconds=30)).strftime('%Y-%m-%d %H:%M:%S')
+        window_start.strftime('%Y-%m-%d %H:%M:%S')
     ))
     count = c.fetchone()[0]
     conn.close()
