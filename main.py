@@ -113,7 +113,8 @@ def webhook():
     note = data.get("note", "Mr.CopriderBot Signal")
     raw_time = data.get("timestamp", "")
     time_ist = format_time_ist(raw_time)
-    
+    chart_link = get_chart_image_url(symbol, tf_raw)
+
     msg = f"""
 📡 Mr.Coprider Bot Signal
 
