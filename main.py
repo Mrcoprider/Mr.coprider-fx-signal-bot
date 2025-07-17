@@ -3,153 +3,161 @@ import sqlite3
 import requests
 from datetime import datetime, timedelta
 import pytz
+import math
 
 app = Flask(__name__)
+DATABASE = 'signals.db'
+TELEGRAM_BOT_TOKEN = '7542580180:AAFTa-QVS344MgPlsnvkYRZeenZ-RINvOoc'
+TELEGRAM_CHAT_ID = '-1002507284584'
 
-# === CONFIG ===
-BOT_TOKEN = "7542580180:AAFTa-QVS344MgPlsnvkYRZeenZ-RINvOoc"
-CHAT_ID = "-1002507284584"
-DB_FILE = "signals.db"
-PIP_MILESTONES = [50, 100, 150, 200, 250, 300]
-IST = pytz.timezone("Asia/Kolkata")
+def init_db():
+    with sqlite3.connect(DATABASE) as conn:
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS trades (
+                id TEXT PRIMARY KEY,
+                symbol TEXT,
+                direction TEXT,
+                entry REAL,
+                sl REAL,
+                tp REAL,
+                timeframe TEXT,
+                note TEXT,
+                timestamp TEXT,
+                status TEXT,
+                last_update_time TEXT,
+                pip_progress REAL,
+                chart_url TEXT
+            )
+        ''')
+init_db()
 
-# === DB INIT ===
-conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-conn.execute('''CREATE TABLE IF NOT EXISTS signals (
-    id TEXT PRIMARY KEY,
-    symbol TEXT,
-    direction TEXT,
-    entry REAL,
-    sl REAL,
-    tp REAL,
-    note TEXT,
-    timeframe TEXT,
-    timestamp TEXT,
-    status TEXT DEFAULT 'Active',
-    pips_hit INTEGER DEFAULT 0
-)''')
-conn.commit()
+def format_time(ts):
+    dt_utc = datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ")
+    dt_ist = dt_utc + timedelta(hours=5, minutes=30)
+    return dt_ist.strftime("%b %d • %I:%M %p")
 
-# === UTILS ===
-def format_time_ist(utc_str):
-    dt = datetime.strptime(utc_str, "%Y-%m-%dT%H:%M:%SZ")
-    dt = pytz.utc.localize(dt).astimezone(IST)
-    return dt.strftime("%d-%b %I:%M %p")
+def format_timeframe(tf):
+    tf = tf.upper()
+    return tf.replace("1", "1M").replace("5", "5M").replace("15", "15M").replace("30", "30M") if tf.isdigit() else tf
 
 def round_price(symbol, price):
-    if any(x in symbol for x in ["JPY", "XAU", "XAG", "DXY"]):
+    if any(x in symbol for x in ["JPY", "XAU", "XAG", "GER", "NAS", "US30", "DJI", "SPX"]):
+        return round(price, 1)
+    if any(x in symbol for x in ["BTC", "ETH", "XRP", "BNB"]):
         return round(price, 2)
+    return round(price, 4)
+
+def pip_size(symbol):
+    return 0.01 if "JPY" in symbol else 0.0001
+
+def pip_diff(entry, current, symbol, direction):
+    diff = (current - entry) / pip_size(symbol)
+    return diff if direction == "Buy" else -diff
+
+def send_telegram(msg, image_url=None):
+    payload = {'chat_id': TELEGRAM_CHAT_ID, 'text': msg, 'parse_mode': 'Markdown'}
+    if image_url:
+        payload['photo'] = image_url
+        requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto", data=payload)
     else:
-        return round(price, 5)
+        requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", data=payload)
 
-def format_tf(tf):
-    return tf.upper().replace("1", "1M").replace("15", "15M").replace("30", "30M").replace("60", "1H").replace("D", "1D")
-
-def send_telegram(msg):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"}
-    requests.post(url, json=payload)
-
-def build_message(data):
-    symbol = data['symbol']
-    direction = data['direction'].capitalize()
-    emoji = "🟢" if direction == "Buy" else "🔴"
-    return f"""{emoji} *{direction} Signal Active*
-*Symbol:* `{symbol}`
-*Entry:* {round_price(symbol, data['entry'])}
-*SL:* {round_price(symbol, data['sl'])}
-*TP:* {round_price(symbol, data['tp'])}
-*Timeframe:* `{format_tf(data['timeframe'])}`
-*Risk/Reward:* `{data['rr']}`
-*Note:* `{data['note']}`
-*Time:* {format_time_ist(data['timestamp'])}
-"""
-
-def build_close_message(row, result, closed_time, pips):
-    emoji = "✅" if result == "TP Hit" else "❌"
-    lock = "🔒"
-    return f"""{lock} *Trade Closed*
-*Symbol:* `{row[1]}`
-🎯 *Result:* {emoji} {result}
-📊 *Pips Gained:* `{pips}`
-🕰️ *Closed At:* {closed_time}
-"""
-
-def calc_pips(symbol, entry, price):
-    factor = 100.0 if "JPY" in symbol else 10000.0
-    return int(round((price - entry) * factor))
-
-# === MAIN ROUTE ===
-@app.route("/webhook", methods=["POST"])
+@app.route('/webhook', methods=['POST'])
 def webhook():
     data = request.json
-    signal_id = data["id"]
+    entry = float(data['entry'])
+    sl = float(data['sl'])
+    tp = float(data['tp'])
+    id = data['id']
+    symbol = data['symbol']
+    direction = data['direction']
+    tf = format_timeframe(data['timeframe'])
+    note = "Logic V.2"
+    timestamp = data['timestamp']
+    time_str = format_time(timestamp)
+    status = "active"
+    now = datetime.utcnow().isoformat() + "Z"
 
-    # Insert into DB
-    conn.execute('''INSERT OR REPLACE INTO signals
-    (id, symbol, direction, entry, sl, tp, note, timeframe, timestamp)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-    (signal_id, data['symbol'], data['direction'], data['entry'], data['sl'], data['tp'],
-     data['note'], data['timeframe'], data['timestamp']))
-    conn.commit()
+    with sqlite3.connect(DATABASE) as conn:
+        conn.execute('''INSERT OR REPLACE INTO trades 
+                        (id, symbol, direction, entry, sl, tp, timeframe, note, timestamp, status, last_update_time, pip_progress, chart_url)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                     (id, symbol, direction, entry, sl, tp, tf, note, timestamp, status, now, 0, "Chart_link_placeholder"))
 
-    # Send initial message
-    send_telegram(build_message(data))
-    return jsonify({"status": "Signal Received"}), 200
+    emoji = "🟩" if direction == "Buy" else "🟥"
+    msg = f"""
+{emoji} *New Signal — {direction}*
+*{symbol}* ({tf})  
+🕒 {time_str}
 
-# === POLLER ROUTE ===
-@app.route("/poll", methods=["GET"])
-def poll():
-    cursor = conn.execute("SELECT * FROM signals WHERE status = 'Active'")
-    rows = cursor.fetchall()
+🎯 Entry: `{round_price(symbol, entry)}`
+🛑 SL: `{round_price(symbol, sl)}`
+🏁 TP: `{round_price(symbol, tp)}`
 
-    for row in rows:
-        signal_id, symbol, direction, entry, sl, tp, note, tf, ts, status, pips_hit = row
-        latest_price = get_live_price(symbol)
-        if latest_price is None: continue
+🧠 Note: {note}
+📸 View Chart → Chart_link_placeholder
+"""
+    send_telegram(msg.strip())
+    return jsonify({"status": "ok"})
 
-        # Check SL or TP
-        result = None
-        if direction.lower() == "buy":
-            if latest_price <= sl:
-                result = "SL Hit"
-            elif latest_price >= tp:
-                result = "TP Hit"
-        else:
-            if latest_price >= sl:
-                result = "SL Hit"
-            elif latest_price <= tp:
-                result = "TP Hit"
+@app.route('/update_price', methods=['POST'])
+def update_price():
+    payload = request.json
+    symbol = payload['symbol']
+    price = float(payload['price'])
 
-        if result:
-            conn.execute("UPDATE signals SET status = 'Closed' WHERE id = ?", (signal_id,))
-            conn.commit()
-            closed_time = datetime.now(IST).strftime("%d-%b %I:%M %p")
-            pips = calc_pips(symbol, entry, latest_price)
-            send_telegram(build_close_message(row, result, closed_time, pips))
-            continue
+    with sqlite3.connect(DATABASE) as conn:
+        cursor = conn.execute("SELECT * FROM trades WHERE symbol=? AND status='active'", (symbol,))
+        rows = cursor.fetchall()
 
-        # Check pip milestones
-        pips = abs(calc_pips(symbol, entry, latest_price))
-        for milestone in PIP_MILESTONES:
-            if pips >= milestone > pips_hit:
-                send_telegram(f"📈 *{symbol}* | `{direction.upper()}` hit `{milestone}` pips 🚀")
-                conn.execute("UPDATE signals SET pips_hit = ? WHERE id = ?", (milestone, signal_id))
-                conn.commit()
-                break
+        for row in rows:
+            id, symbol, direction, entry, sl, tp, tf, note, ts, status, last_update, pip_prog, chart_url = row
+            pips = pip_diff(entry, price, symbol, direction)
 
-    return jsonify({"status": "Polling Done"}), 200
+            milestones = [50, 100, 150, 200, 250, 300]
+            hit_milestone = next((m for m in milestones if math.isclose(pips, m, abs_tol=1)), None)
 
-# === DUMMY PRICE FETCH ===
-def get_live_price(symbol):
-    dummy_prices = {
-        "EURUSD": 1.1000,
-        "USDJPY": 155.20,
-        "XAUUSD": 2325.5,
-        "BTCUSD": 65432.1
-    }
-    return dummy_prices.get(symbol)
+            progress = 100 * (price - entry) / (tp - entry) if direction == "Buy" else 100 * (entry - price) / (entry - tp)
+            progress = max(0, min(progress, 100))
 
-# === MAIN ===
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000)
+            conn.execute("UPDATE trades SET pip_progress=?, last_update_time=? WHERE id=?",
+                         (progress, datetime.utcnow().isoformat() + "Z", id))
+
+            if hit_milestone:
+                send_telegram(f"📍 *{symbol}* hit +{hit_milestone} pips ({direction})")
+
+            if (direction == "Buy" and price >= tp) or (direction == "Sell" and price <= tp):
+                conn.execute("UPDATE trades SET status='tp' WHERE id=?", (id,))
+                send_telegram(f"🎯 *TP HIT!* {symbol} ({direction})\n+{round(pips)} pips ✅")
+            elif (direction == "Buy" and price <= sl) or (direction == "Sell" and price >= sl):
+                conn.execute("UPDATE trades SET status='sl' WHERE id=?", (id,))
+                send_telegram(f"❌ *SL HIT!* {symbol} ({direction})\n-{round(abs(pips))} pips 🔻")
+            elif pips >= 100 and pip_prog < 100:
+                trail_sl = entry + 50 * pip_size(symbol) if direction == "Buy" else entry - 50 * pip_size(symbol)
+                send_telegram(f"🔄 *Trailing SL Activated*\n{symbol} ({direction})\nSL moved to `{round_price(symbol, trail_sl)}` ✅")
+
+            elif round(progress, 1) % 10 < 1 and progress > 0:
+                send_telegram(f"📊 *{symbol}* TP Progress: `{round(progress, 1)}%`")
+
+    return jsonify({"status": "updated"})
+
+@app.route('/summary', methods=['GET'])
+def summary():
+    today = datetime.utcnow().strftime('%Y-%m-%d')
+    with sqlite3.connect(DATABASE) as conn:
+        result = conn.execute("SELECT COUNT(*), SUM(status='tp'), SUM(status='sl') FROM trades WHERE timestamp LIKE ?", (f"{today}%",)).fetchone()
+        total, tp_hit, sl_hit = result
+        win_rate = f"{(tp_hit / total * 100):.1f}%" if total else "0%"
+        msg = f"""
+📊 *Daily Summary* — {today}
+
+✅ Total Signals: {total}
+🎯 TP Hit: {tp_hit}
+❌ SL Hit: {sl_hit}
+🏆 Win Rate: {win_rate}
+"""
+        send_telegram(msg.strip())
+        return jsonify({"status": "sent"})
+
+if __name__ == '__main__':
+    app.run(debug=True)
