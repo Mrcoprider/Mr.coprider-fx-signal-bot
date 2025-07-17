@@ -3,6 +3,7 @@ import sqlite3
 import requests
 from datetime import datetime, timedelta
 import pytz
+import os
 
 app = Flask(__name__)
 
@@ -10,44 +11,85 @@ app = Flask(__name__)
 BOT_TOKEN = "7542580180:AAFTa-QVS344MgPlsnvkYRZeenZ-RINvOoc"
 CHAT_ID = "-1002507284584"
 DB_FILE = "signals.db"
-
+IST = pytz.timezone("Asia/Kolkata")
 
 # === UTILS ===
-def ist_time(utc_str):
-    utc_dt = datetime.strptime(utc_str, "%Y-%m-%d %H:%M:%S")
-    utc_dt = pytz.utc.localize(utc_dt)
-    ist_dt = utc_dt.astimezone(pytz.timezone('Asia/Kolkata'))
-    return ist_dt.strftime('%d-%b %H:%M IST')
+def round_price(symbol, price):
+    if symbol.endswith(("JPY", "XAUUSD", "DXY")):
+        return round(price, 2)
+    elif symbol.endswith(("BTCUSD", "ETHUSD")):
+        return round(price, 2)
+    else:
+        return round(price, 4)
 
+def format_timeframe(tf):
+    mapping = {"1": "1M", "3": "3M", "5": "5M", "15": "15M", "30": "30M", "60": "H1", "120": "H2",
+               "240": "H4", "D": "Daily", "W": "Weekly", "M": "Monthly"}
+    return mapping.get(tf, tf)
+
+def convert_to_ist(utc_str):
+    utc_dt = datetime.strptime(utc_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=pytz.utc)
+    return utc_dt.astimezone(IST).strftime("%d-%b-%Y %I:%M %p")
 
 def format_message(data):
-    tf = data['timeframe']
-    tf_fmt = tf.replace("D", "Daily").replace("H", "H").replace("M", "M")
-    return f"""
-🚨 *{data['direction'].upper()} SIGNAL*
+    symbol = data['symbol']
+    direction = data['direction'].upper()
+    entry = round_price(symbol, float(data['entry']))
+    sl = round_price(symbol, float(data['sl']))
+    tp = round_price(symbol, float(data['tp']))
+    tf = format_timeframe(data['timeframe'])
+    timestamp = convert_to_ist(data['timestamp'])
+    note = data['note']
+    return (
+        f"📡 Mr.Coprider Bot Signal\n\n"
+        f"{'🟢' if direction == 'BUY' else '🔴'} {symbol} | {direction}\n"
+        f"Timeframe: {tf}\n"
+        f"Entry: {entry}\n"
+        f"SL: {sl}\n"
+        f"TP: {tp}\n"
+        f"🕐 {timestamp}\n"
+        f"📝 {note}"
+    )
 
-*Symbol:* `{data['symbol']}`
-*Timeframe:* `{tf_fmt}`
-*Entry:* `{round(float(data['entry']), 5)}`
-*SL:* `{round(float(data['sl']), 5)}`
-*TP:* `{round(float(data['tp']), 5)}`
-*Note:* `{data['note']}`
-*Time:* `{ist_time(data['timestamp'])}`
-"""
-
-
-def send_telegram(message):
+def send_telegram(msg):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": CHAT_ID,
-        "text": message,
+        "text": msg,
         "parse_mode": "Markdown"
     }
     response = requests.post(url, json=payload)
-    if response.status_code == 200:
-        return response.json().get("result", {}).get("message_id")
-    return None
+    return response.json().get("result", {}).get("message_id", None)
 
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS trades (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT,
+        direction TEXT,
+        entry REAL,
+        sl REAL,
+        tp REAL,
+        timeframe TEXT,
+        note TEXT,
+        timestamp TEXT,
+        telegram_msg_id INTEGER,
+        status TEXT DEFAULT "open"
+    )''')
+    conn.commit()
+    conn.close()
+
+def save_trade(data, msg_id):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("INSERT INTO trades (symbol, direction, entry, sl, tp, timeframe, note, timestamp, telegram_msg_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (
+        data['symbol'], data['direction'], data['entry'],
+        data['sl'], data['tp'], data['timeframe'],
+        data['note'], data['timestamp'], msg_id
+    ))
+    conn.commit()
+    conn.close()
 
 def is_duplicate_signal(data):
     conn = sqlite3.connect(DB_FILE)
@@ -64,60 +106,20 @@ def is_duplicate_signal(data):
     conn.close()
     return count > 0
 
-
-def save_trade(data, msg_id):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS trades (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        symbol TEXT,
-        direction TEXT,
-        entry REAL,
-        sl REAL,
-        tp REAL,
-        timeframe TEXT,
-        note TEXT,
-        timestamp TEXT,
-        message_id INTEGER,
-        status TEXT DEFAULT 'active'
-    )''')
-
-    c.execute('''INSERT INTO trades (
-        symbol, direction, entry, sl, tp, timeframe, note, timestamp, message_id
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''', (
-        data['symbol'], data['direction'], float(data['entry']),
-        float(data['sl']), float(data['tp']),
-        data['timeframe'], data['note'],
-        datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
-        msg_id
-    ))
-    conn.commit()
-    conn.close()
-
-
-# === ROUTES ===
-@app.route('/', methods=['GET'])
-def home():
-    return "Mr.Coprider Bot Signal API is running."
-
-
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    data = request.get_json()
-
-    required_fields = ['symbol', 'direction', 'entry', 'sl', 'tp', 'note', 'timeframe', 'timestamp']
-    if not all(field in data for field in required_fields):
-        return jsonify({"error": "Missing fields in request"}), 400
+@app.route('/', methods=['POST'])
+def receive_signal():
+    data = request.json
+    data['note'] = "Mr.CopriderBot Signal" if data['note'] == "{{note}}" else data['note']
+    data['timestamp'] = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
 
     if is_duplicate_signal(data):
-        return jsonify({"message": "Duplicate signal ignored"}), 200
+        return jsonify({"status": "duplicate_ignored"})
 
-    message = format_message(data)
-    msg_id = send_telegram(message)
+    msg = format_message(data)
+    msg_id = send_telegram(msg)
     save_trade(data, msg_id)
+    return jsonify({"status": "received", "msg_id": msg_id})
 
-    return jsonify({"message": "Signal processed"}), 200
-
-
-if __name__ == '__main__':
+if __name__ == "__main__":
+    init_db()
     app.run(debug=True)
