@@ -1,8 +1,10 @@
-from flask import Flask, request, jsonify, send_file
-import sqlite3, requests, random
-from datetime import datetime
+from flask import Flask, request, jsonify
+import sqlite3
+import requests
+from datetime import datetime, timedelta
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
+import random
 
 app = Flask(__name__)
 
@@ -10,221 +12,165 @@ app = Flask(__name__)
 BOT_TOKEN = "7542580180:AAFTa-QVS344MgPlsnvkYRZeenZ-RINvOoc"
 CHAT_ID = "-1002507284584"
 DB_FILE = "signals.db"
-PIP_MILESTONES = [100, 200, 300, 400, 500]
-ALPHA_VANTAGE_API_KEY = "OQIDE6XSFM8O6XHD"
+PIP_MILESTONES = [50, 100, 150, 200, 250, 300]
 
-# === DB INIT ===
+# === UTILS ===
+
+def round_price(symbol, price):
+    if any(x in symbol for x in ["JPY", "XAU", "XAG"]):
+        return round(price, 2)
+    elif any(x in symbol for x in ["BTC", "ETH", "DXY"]):
+        return round(price, 1)
+    else:
+        return round(price, 4)
+
+def calculate_pips(symbol, entry, current, direction):
+    diff = (current - entry) * (10 if "JPY" in symbol else 10000)
+    return int(diff) if direction == "Buy" else int(-diff)
+
+def get_current_time():
+    utc_now = datetime.utcnow().replace(tzinfo=pytz.utc)
+    return utc_now.astimezone(pytz.timezone("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M:%S")
+
+def format_tf(tf):
+    return tf.replace("1", "1M").replace("5", "5M").replace("15", "15M").replace("30", "30M").replace("60", "H1").replace("240", "H4").replace("D", "Daily")
+
+def format_message(data, pips=None, status=None, link=None):
+    msg = f"📡 *{data['symbol']}* ({format_tf(data['timeframe'])})\n"
+    msg += f"📈 *{data['direction']}* @ {round_price(data['symbol'], data['entry'])}\n"
+    msg += f"🛡 SL: {round_price(data['symbol'], data['sl'])} | 🎯 TP: {round_price(data['symbol'], data['tp'])}\n"
+    msg += f"📊 RR: {data['rr']} | 🧮 Risk: {data['risk']}\n"
+    if pips is not None:
+        msg += f"📍 *{pips} Pips {'Reached' if not status else status}*"
+    msg += f"\n🕰 {get_current_time()}\n🧠 {data['note']}"
+    if link:
+        msg += f"\n🔗 [View Message]({link})"
+    return msg
+
+# === TELEGRAM ===
+
+def send_telegram(msg):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"}
+    r = requests.post(url, json=payload)
+    if r.ok:
+        result = r.json()
+        return result['result']['message_id']
+    return None
+
+# === DATABASE ===
+
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS trades (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            symbol TEXT,
-            direction TEXT,
-            entry REAL,
-            sl REAL,
-            tp REAL,
-            timeframe TEXT,
-            note TEXT,
-            timestamp TEXT,
-            status TEXT DEFAULT 'open',
-            pips_hit TEXT DEFAULT '',
-            message_id INTEGER
-        )
-    ''')
+    c.execute('''CREATE TABLE IF NOT EXISTS trades
+                 (id TEXT PRIMARY KEY, symbol TEXT, direction TEXT, entry REAL, sl REAL, tp REAL,
+                  risk TEXT, rr TEXT, timeframe TEXT, note TEXT, timestamp TEXT, status TEXT,
+                  msg_id INTEGER, milestones TEXT)''')
     conn.commit()
     conn.close()
+
+def save_trade(data, msg_id):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO trades VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              (data['id'], data['symbol'], data['direction'], data['entry'], data['sl'], data['tp'],
+               data['risk'], data['rr'], data['timeframe'], data['note'], data['timestamp'], 'open', msg_id, ''))
+    conn.commit()
+    conn.close()
+
+def update_status(trade_id, status):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("UPDATE trades SET status=? WHERE id=?", (status, trade_id))
+    conn.commit()
+    conn.close()
+
+def mark_milestone(trade_id, milestone):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT milestones FROM trades WHERE id=?", (trade_id,))
+    row = c.fetchone()
+    hit = row[0].split(',') if row and row[0] else []
+    if str(milestone) not in hit:
+        hit.append(str(milestone))
+        c.execute("UPDATE trades SET milestones=? WHERE id=?", (','.join(hit), trade_id))
+    conn.commit()
+    conn.close()
+
+def get_open_trades():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT * FROM trades WHERE status='open'")
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+# === POLLING ===
+
+def poll_price(symbol):
+    return round(random.uniform(1.1, 1.5), 4)  # mock
+
+def monitor():
+    for row in get_open_trades():
+        id, symbol, direction, entry, sl, tp, risk, rr, tf, note, ts, status, msg_id, milestones = row
+        price = poll_price(symbol)
+        pips = calculate_pips(symbol, entry, price, direction)
+
+        # SL / TP Check
+        if (direction == "Buy" and price <= sl) or (direction == "Sell" and price >= sl):
+            update_status(id, 'SL')
+            link = f"https://t.me/Mr_CopriderFx/{msg_id}"
+            send_telegram(format_message(row_as_dict(row), pips, "SL Hit", link))
+        elif (direction == "Buy" and price >= tp) or (direction == "Sell" and price <= tp):
+            update_status(id, 'TP')
+            link = f"https://t.me/Mr_CopriderFx/{msg_id}"
+            send_telegram(format_message(row_as_dict(row), pips, "TP Hit", link))
+
+        # Real-Time Milestones
+        for m in PIP_MILESTONES:
+            if abs(pips) >= m and str(m) not in milestones.split(','):
+                mark_milestone(id, m)
+                link = f"https://t.me/Mr_CopriderFx/{msg_id}"
+                send_telegram(format_message(row_as_dict(row), m, None, link))
+
+# === TIMED PnL UPDATE ===
+
+def timed_update():
+    for row in get_open_trades():
+        id, symbol, direction, entry, sl, tp, risk, rr, tf, note, ts, status, msg_id, milestones = row
+        price = poll_price(symbol)
+        pips = calculate_pips(symbol, entry, price, direction)
+        link = f"https://t.me/Mr_CopriderFx/{msg_id}"
+        send_telegram(format_message(row_as_dict(row), pips, "Timed Update", link))
+
+# === UTILITY ===
+
+def row_as_dict(row):
+    return {
+        'id': row[0], 'symbol': row[1], 'direction': row[2], 'entry': row[3], 'sl': row[4],
+        'tp': row[5], 'risk': row[6], 'rr': row[7], 'timeframe': row[8],
+        'note': row[9], 'timestamp': row[10]
+    }
+
+# === API ===
+
+@app.route('/', methods=['POST'])
+def receive_signal():
+    data = request.json
+    data['note'] = "Mr.CopriderBot Signal" if data['note'] == "{{note}}" else data['note']
+    msg = format_message(data)
+    msg_id = send_telegram(msg)
+    save_trade(data, msg_id)
+    return jsonify({"status": "received", "msg_id": msg_id})
+
+# === INIT ===
 
 init_db()
+sched = BackgroundScheduler()
+sched.add_job(monitor, 'interval', seconds=30)
+sched.add_job(timed_update, 'interval', minutes=15)
+sched.start()
 
-# === FORMATTERS ===
-def format_tf(tf):
-    tf = tf.upper()
-    return {
-        "1": "1M", "3": "3M", "5": "5M", "15": "15M", "30": "30M",
-        "60": "H1", "1H": "H1", "H1": "H1",
-        "120": "H2", "2H": "H2", "H2": "H2",
-        "240": "H4", "4H": "H4", "H4": "H4",
-        "D": "Daily", "1D": "Daily",
-        "W": "Weekly", "1W": "Weekly",
-        "M": "Monthly", "1M": "Monthly"
-    }.get(tf, tf)
-
-def format_time_ist(timestamp):
-    try:
-        dt = datetime.strptime(timestamp, "%Y-%m-%dT%H:%M:%SZ")
-        dt_utc = pytz.utc.localize(dt)
-        dt_ist = dt_utc.astimezone(pytz.timezone("Asia/Kolkata"))
-        return dt_ist.strftime("%d-%b-%Y %I:%M %p")
-    except:
-        return timestamp
-
-def round_price(value, symbol):
-    symbol = symbol.upper()
-    if any(k in symbol for k in ["XAU", "XAG", "US30", "NAS", "GER", "IND", "BTC", "ETH"]):
-        return round(value, 2)
-    return round(value, 5)
-
-def calc_pips(symbol, entry, price, direction):
-    symbol = symbol.upper()
-    if "XAU" in symbol:
-        pip_size = 0.1
-    elif "XAG" in symbol or "US30" in symbol or "NAS" in symbol or "GER" in symbol or "IND" in symbol:
-        pip_size = 1
-    elif "JPY" in symbol:
-        pip_size = 0.01
-    elif "BTC" in symbol or "ETH" in symbol:
-        pip_size = 1
-    else:
-        pip_size = 0.0001
-
-    diff = price - entry if direction.lower() == "buy" else entry - price
-    return round(diff / pip_size)
-
-# === LIVE PRICE ===
-def fetch_live_price(symbol):
-    fx_symbol = symbol.upper().replace("/", "")
-    base = fx_symbol[:3]
-    quote = fx_symbol[3:]
-    url = f"https://www.alphavantage.co/query?function=CURRENCY_EXCHANGE_RATE&from_currency={base}&to_currency={quote}&apikey={ALPHA_VANTAGE_API_KEY}"
-    try:
-        response = requests.get(url, timeout=10).json()
-        price = float(response["Realtime Currency Exchange Rate"]["5. Exchange Rate"])
-        return round(price, 5)
-    except:
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("SELECT entry FROM trades WHERE symbol = ? ORDER BY id DESC LIMIT 1", (symbol,))
-        result = c.fetchone()
-        conn.close()
-        if result:
-            base_price = result[0]
-            return round(base_price + random.uniform(-0.005, 0.005), 5)
-        return 0
-
-# === TELEGRAM ===
-def send_telegram(message):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "Markdown"}
-    requests.post(url, json=payload)
-
-# === POST SIGNAL ===
-@app.route("/", methods=["POST"])
-def receive_signal():
-    data = request.get_json()
-    symbol = data.get("symbol", "").replace("{{ticker}}", "").strip().upper()
-    tf = format_tf(data.get("timeframe", "").replace("{{interval}}", "").strip())
-    direction = data.get("direction", "")
-    entry = round_price(data.get("entry", 0), symbol)
-    sl = round_price(data.get("sl", 0), symbol)
-    tp = round_price(data.get("tp", 0), symbol)
-    note = data.get("note", "Mr.CopriderBot Signal")
-    timestamp = format_time_ist(data.get("timestamp", ""))
-
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('''
-        INSERT INTO trades (symbol, direction, entry, sl, tp, timeframe, note, timestamp)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (symbol, direction, entry, sl, tp, tf, note, timestamp))
-    conn.commit()
-    conn.close()
-
-    emoji = "🟢" if direction.lower() == "buy" else "🔴"
-    msg = f"""
-📡 Mr.Coprider Bot Signal
-
-{emoji} {symbol} | {direction.upper()}
-Timeframe: {tf}
-Entry: {entry}
-SL: {sl}
-TP: {tp}
-🕐 {timestamp}
-📝 {note}
-""".strip()
-    send_telegram(msg)
-    return jsonify({"message": "Signal posted"})
-
-# === POLL PRICES ===
-def poll_prices():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT * FROM trades WHERE status = 'open'")
-    rows = c.fetchall()
-
-    for row in rows:
-        trade_id, symbol, direction, entry, sl, tp, tf, note, timestamp, status, pips_hit, message_id = row
-        current = fetch_live_price(symbol)
-        pips = calc_pips(symbol, entry, current, direction)
-        closed = False
-        final_msg = None
-
-        if direction.lower() == "buy":
-            if current >= tp:
-                final_msg = f"🎯 *TP Hit* on {symbol} | Pips gained: +{pips}"
-                closed = True
-            elif current <= sl:
-                final_msg = f"🛑 *SL Hit* on {symbol} | Pips gained: {pips}"
-                closed = True
-        elif direction.lower() == "sell":
-            if current <= tp:
-                final_msg = f"🎯 *TP Hit* on {symbol} | Pips gained: +{pips}"
-                closed = True
-            elif current >= sl:
-                final_msg = f"🛑 *SL Hit* on {symbol} | Pips gained: {pips}"
-                closed = True
-
-        if closed:
-            c.execute("UPDATE trades SET status = 'closed' WHERE id = ?", (trade_id,))
-            conn.commit()
-            send_telegram(final_msg)
-            continue
-
-        for milestone in PIP_MILESTONES:
-            if pips >= milestone and f"{milestone}" not in pips_hit.split(","):
-                send_telegram(f"📶 {symbol} | *{milestone} pips* gained so far")
-                updated = ",".join(filter(None, [pips_hit, str(milestone)]))
-                c.execute("UPDATE trades SET pips_hit = ? WHERE id = ?", (updated, trade_id))
-                conn.commit()
-
-    conn.close()
-
-# === SCHEDULER ===
-scheduler = BackgroundScheduler()
-scheduler.add_job(poll_prices, 'interval', minutes=1)
-scheduler.start()
-
-# === DB DOWNLOAD ===
-@app.route("/download-db", methods=["GET"])
-def download_db():
-    try:
-        date_str = datetime.now().strftime("%d-%b-%Y")
-        filename = f"signals_{date_str}.db"
-        return send_file(DB_FILE, as_attachment=True, download_name=filename)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-# === HTML VIEW ===
-@app.route("/show-trades", methods=["GET"])
-def show_trades():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT symbol, direction, entry, sl, tp, timeframe, timestamp, status, pips_hit FROM trades ORDER BY id DESC")
-    rows = c.fetchall()
-    conn.close()
-
-    html = """
-    <html><head><title>Mr.Coprider Trades</title><meta name='viewport' content='width=device-width, initial-scale=1.0'>
-    <style>body{font-family:Arial;padding:1em;background:#f4f4f4;}table{width:100%;border-collapse:collapse;background:#fff;}
-    th,td{padding:10px;border:1px solid #ccc;text-align:center;}th{background:#222;color:#fff;}tr:nth-child(even){background:#f9f9f9;}
-    </style></head><body><h2>📊 Trade History</h2><table><tr><th>Symbol</th><th>Dir</th><th>Entry</th><th>SL</th><th>TP</th><th>TF</th><th>Time</th><th>Status</th><th>Pips</th></tr>
-    """
-    for row in rows:
-        html += "<tr>" + "".join(f"<td>{cell}</td>" for cell in row) + "</tr>"
-    html += "</table></body></html>"
-    return html
-
-# === RUN ===
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080)
+if __name__ == '__main__':
+    app.run(debug=True)
