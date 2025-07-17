@@ -1,11 +1,11 @@
-import os from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify
 import sqlite3
 import requests
 from datetime import datetime, timedelta
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
 import random
-
+import os
 app = Flask(__name__)
 
 # === CONFIG ===
