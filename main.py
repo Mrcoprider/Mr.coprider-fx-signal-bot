@@ -23,8 +23,11 @@ def round_price(symbol, price):
         return round(price, 4)
 
 def format_timeframe(tf):
-    mapping = {"1": "1M", "3": "3M", "5": "5M", "15": "15M", "30": "30M", "60": "H1", "120": "H2",
-               "240": "H4", "D": "Daily", "W": "Weekly", "M": "Monthly"}
+    mapping = {
+        "1": "1M", "3": "3M", "5": "5M", "15": "15M", "30": "30M",
+        "60": "H1", "120": "H2", "240": "H4",
+        "D": "Daily", "W": "Weekly", "M": "Monthly"
+    }
     return mapping.get(tf, tf)
 
 def convert_to_ist(utc_str):
@@ -39,7 +42,7 @@ def format_message(data):
     tp = round_price(symbol, float(data['tp']))
     tf = format_timeframe(data['timeframe'])
     timestamp = convert_to_ist(data['timestamp'])
-    note = data['note']
+    note = data.get('note', '')
     return (
         f"📡 Mr.Coprider Bot Signal\n\n"
         f"{'🟢' if direction == 'BUY' else '🔴'} {symbol} | {direction}\n"
@@ -92,10 +95,8 @@ def save_trade(data, msg_id):
     conn.close()
 
 def is_duplicate_signal(data):
-    ist = pytz.timezone("Asia/Kolkata")
-    now_ist = datetime.now(ist)
+    now_ist = datetime.now(IST)
     window_start = now_ist - timedelta(seconds=30)
-
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("""
@@ -110,21 +111,28 @@ def is_duplicate_signal(data):
     conn.close()
     return count > 0
 
-@app.route('/', methods=['POST'])
+@app.route('/webhook', methods=['POST'])
 def receive_signal():
-    data = request.json
-    data['note'] = "Mr.CopriderBot Signal" if data['note'] == "{{note}}" else data['note']
-    data['timestamp'] = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+    try:
+        data = request.json
+        if not data:
+            return jsonify({"status": "error", "message": "Invalid or missing JSON"}), 400
 
-    if is_duplicate_signal(data):
-        return jsonify({"status": "duplicate_ignored"})
+        # Default note if placeholder
+        data['note'] = "Mr.CopriderBot Signal" if data.get('note') in [None, "{{note}}"] else data['note']
+        data['timestamp'] = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
 
-    msg = format_message(data)
-    msg_id = send_telegram(msg)
-    save_trade(data, msg_id)
-    return jsonify({"status": "received", "msg_id": msg_id})
+        if is_duplicate_signal(data):
+            return jsonify({"status": "duplicate_ignored"})
+
+        msg = format_message(data)
+        msg_id = send_telegram(msg)
+        save_trade(data, msg_id)
+        return jsonify({"status": "received", "msg_id": msg_id})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 if __name__ == "__main__":
-    import os
     port = int(os.environ.get("PORT", 5000))
+    init_db()
     app.run(host="0.0.0.0", port=port, debug=False)
