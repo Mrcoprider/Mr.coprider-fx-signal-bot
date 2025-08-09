@@ -9,7 +9,7 @@ app = Flask(__name__)
 
 # === CONFIG ===
 BOT_TOKEN = "7542580180:AAFTa-QVS344MgPlsnvkYRZeenZ-RINvOoc"
-CHAT_ID = "-1002507284584"
+CHAT_IDS = ["-1002507284584", "-1002736244537"]  # multiple group IDs here
 DB_FILE = "signals.db"
 IST = pytz.timezone("Asia/Kolkata")
 
@@ -23,11 +23,8 @@ def round_price(symbol, price):
         return round(price, 4)
 
 def format_timeframe(tf):
-    mapping = {
-        "1": "1M", "3": "3M", "5": "5M", "15": "15M", "30": "30M",
-        "60": "H1", "120": "H2", "240": "H4",
-        "D": "Daily", "W": "Weekly", "M": "Monthly"
-    }
+    mapping = {"1": "1M", "3": "3M", "5": "5M", "15": "15M", "30": "30M", "60": "H1", "120": "H2",
+               "240": "H4", "D": "Daily", "W": "Weekly", "M": "Monthly"}
     return mapping.get(tf, tf)
 
 def convert_to_ist(utc_str):
@@ -42,7 +39,7 @@ def format_message(data):
     tp = round_price(symbol, float(data['tp']))
     tf = format_timeframe(data['timeframe'])
     timestamp = convert_to_ist(data['timestamp'])
-    note = data.get('note', '')
+    note = data['note']
     return (
         f"📡 Mr.Coprider Bot Signal\n\n"
         f"{'🟢' if direction == 'BUY' else '🔴'} {symbol} | {direction}\n"
@@ -56,13 +53,17 @@ def format_message(data):
 
 def send_telegram(msg):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": msg,
-        "parse_mode": "Markdown"
-    }
-    response = requests.post(url, json=payload)
-    return response.json().get("result", {}).get("message_id", None)
+    last_msg_id = None
+    for chat_id in CHAT_IDS:
+        payload = {
+            "chat_id": chat_id,
+            "text": msg,
+            "parse_mode": "Markdown"
+        }
+        response = requests.post(url, json=payload)
+        print(f"Sent to {chat_id}: {response.text}")  # Debug log
+        last_msg_id = response.json().get("result", {}).get("message_id", None)
+    return last_msg_id
 
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -111,28 +112,21 @@ def is_duplicate_signal(data):
     conn.close()
     return count > 0
 
-@app.route('/webhook', methods=['POST'])
+@app.route('/', methods=['POST'])
 def receive_signal():
-    try:
-        data = request.json
-        if not data:
-            return jsonify({"status": "error", "message": "Invalid or missing JSON"}), 400
+    data = request.json
+    data['note'] = "Mr.CopriderBot Signal" if data['note'] == "{{note}}" else data['note']
+    data['timestamp'] = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
 
-        # Default note if placeholder
-        data['note'] = "Mr.CopriderBot Signal" if data.get('note') in [None, "{{note}}"] else data['note']
-        data['timestamp'] = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+    if is_duplicate_signal(data):
+        return jsonify({"status": "duplicate_ignored"})
 
-        if is_duplicate_signal(data):
-            return jsonify({"status": "duplicate_ignored"})
-
-        msg = format_message(data)
-        msg_id = send_telegram(msg)
-        save_trade(data, msg_id)
-        return jsonify({"status": "received", "msg_id": msg_id})
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
+    msg = format_message(data)
+    msg_id = send_telegram(msg)
+    save_trade(data, msg_id)
+    return jsonify({"status": "received", "msg_id": msg_id})
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
     init_db()
+    port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
