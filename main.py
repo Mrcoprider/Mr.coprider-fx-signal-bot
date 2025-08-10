@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify
 import sqlite3
 import requests
+import json
 from datetime import datetime, timedelta
 import pytz
 import os
@@ -9,8 +10,8 @@ app = Flask(__name__)
 
 # === CONFIG ===
 BOT_TOKEN = "7542580180:AAFTa-QVS344MgPlsnvkYRZeenZ-RINvOoc"
-CHAT_ID_1 = "-1002507284584"       # First group
-CHAT_ID_2 = "-1002736244537"       # Second group
+CHAT_ID_1 = "-1002507284584"    # First group
+CHAT_ID_2 = "-1002736244537"    # Second group
 DB_FILE = "signals.db"
 IST = pytz.timezone("Asia/Kolkata")
 
@@ -24,11 +25,8 @@ def round_price(symbol, price):
         return round(price, 4)
 
 def format_timeframe(tf):
-    mapping = {
-        "1": "1M", "3": "3M", "5": "5M", "15": "15M", "30": "30M",
-        "60": "H1", "120": "H2", "240": "H4", "D": "Daily",
-        "W": "Weekly", "M": "Monthly"
-    }
+    mapping = {"1": "1M", "3": "3M", "5": "5M", "15": "15M", "30": "30M", "60": "H1", "120": "H2",
+               "240": "H4", "D": "Daily", "W": "Weekly", "M": "Monthly"}
     return mapping.get(tf, tf)
 
 def convert_to_ist(utc_str):
@@ -55,7 +53,7 @@ def format_message(data):
         f"📝 {note}"
     )
 
-def send_telegram(chat_id, msg):
+def send_telegram_to_group(msg, chat_id):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": chat_id,
@@ -63,7 +61,6 @@ def send_telegram(chat_id, msg):
         "parse_mode": "Markdown"
     }
     response = requests.post(url, json=payload)
-    print(f"📤 Sent to {chat_id}: {response.json()}")
     return response.json().get("result", {}).get("message_id", None)
 
 def init_db():
@@ -115,32 +112,39 @@ def is_duplicate_signal(data):
     conn.close()
     return count > 0
 
-# === MULTI-ROUTE WEBHOOK ===
-@app.route('/', methods=['POST'])
 @app.route('/webhook', methods=['POST'])
-@app.route('/webhook/', methods=['POST'])
 def receive_signal():
-    print("📥 Webhook received:", request.data)  # Debug log
+    raw_data = request.data.decode('utf-8').strip()
 
-    data = request.json
-    if not data:
-        return jsonify({"status": "error", "reason": "No JSON payload"})
+    # If TradingView sends with prefix like "Alert on BTCUSD {...}"
+    if raw_data.startswith("Alert on"):
+        start_index = raw_data.find("{")
+        if start_index != -1:
+            raw_data = raw_data[start_index:]
 
-    data['note'] = "Mr.CopriderBot Signal" if data['note'] == "{{note}}" else data['note']
+    try:
+        data = json.loads(raw_data)
+    except Exception as e:
+        return jsonify({"status": "error", "error": f"Invalid JSON: {str(e)}"}), 400
+
+    data['note'] = "Mr.CopriderBot Signal" if data.get('note') == "{{note}}" else data.get('note', '')
     data['timestamp'] = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
 
     if is_duplicate_signal(data):
-        print("⚠️ Duplicate signal ignored.")
         return jsonify({"status": "duplicate_ignored"})
 
     msg = format_message(data)
 
     # Send to both groups
-    msg_id_1 = send_telegram(CHAT_ID_1, msg)
-    send_telegram(CHAT_ID_2, msg)
+    msg_id1 = send_telegram_to_group(msg, CHAT_ID_1)
+    msg_id2 = send_telegram_to_group(msg, CHAT_ID_2)
 
-    save_trade(data, msg_id_1)
-    return jsonify({"status": "received", "msg_id": msg_id_1})
+    save_trade(data, msg_id1)
+    return jsonify({
+        "status": "received",
+        "msg_id_group1": msg_id1,
+        "msg_id_group2": msg_id2
+    })
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
