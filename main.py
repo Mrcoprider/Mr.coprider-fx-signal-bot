@@ -10,8 +10,8 @@ app = Flask(__name__)
 
 # === CONFIG ===
 BOT_TOKEN = "7542580180:AAFTa-QVS344MgPlsnvkYRZeenZ-RINvOoc"
-CHAT_ID_1 = "-1002507284584"    # First group
-CHAT_ID_2 = "-1002736244537"    # Second group
+CHAT_ID_1 = "-1002507284584"
+CHAT_ID_2 = "-1002736244537"
 DB_FILE = "signals.db"
 IST = pytz.timezone("Asia/Kolkata")
 
@@ -43,10 +43,7 @@ def format_message(data):
     timestamp = convert_to_ist(data['timestamp'])
     note = data['note']
     
-    # Add an icon if mitigation alert detected
-    mitigation_icon = ""
-    if "Mitigated" in note:
-        mitigation_icon = "💡 "
+    mitigation_icon = "💡 " if "Mitigated" in note else ""
     
     return (
         f"📡 Mr.Coprider Bot Signal\n\n"
@@ -117,11 +114,14 @@ def is_duplicate_signal(data):
     conn.close()
     return count > 0
 
+@app.route('/', methods=['GET'])
+def home():
+    return "Mr.Coprider Bot Webhook is running."
+
 @app.route('/webhook', methods=['POST'])
 def receive_signal():
     raw_data = request.data.decode('utf-8').strip()
 
-    # If TradingView sends with prefix like "Alert on BTCUSD {...}"
     if raw_data.startswith("Alert on"):
         start_index = raw_data.find("{")
         if start_index != -1:
@@ -132,9 +132,7 @@ def receive_signal():
     except Exception as e:
         return jsonify({"status": "error", "error": f"Invalid JSON: {str(e)}"}), 400
 
-    # Override note only if "{{note}}", else keep as is (to detect Mitigation notes)
     data['note'] = "Mr.CopriderBot Signal" if data.get('note') == "{{note}}" else data.get('note', '')
-    # Use provided timestamp if present, else current UTC time
     if not data.get('timestamp'):
         data['timestamp'] = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
 
@@ -143,7 +141,6 @@ def receive_signal():
 
     msg = format_message(data)
 
-    # Send to both groups
     msg_id1 = send_telegram_to_group(msg, CHAT_ID_1)
     msg_id2 = send_telegram_to_group(msg, CHAT_ID_2)
 
@@ -155,6 +152,6 @@ def receive_signal():
     })
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 10000))  # Default changed to 10000 for Render
     init_db()
     app.run(host="0.0.0.0", port=port, debug=False)
