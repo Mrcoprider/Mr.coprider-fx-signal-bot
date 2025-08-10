@@ -42,9 +42,15 @@ def format_message(data):
     tf = format_timeframe(data['timeframe'])
     timestamp = convert_to_ist(data['timestamp'])
     note = data['note']
+    
+    # Add an icon if mitigation alert detected
+    mitigation_icon = ""
+    if "Mitigated" in note:
+        mitigation_icon = "💡 "
+    
     return (
         f"📡 Mr.Coprider Bot Signal\n\n"
-        f"{'🟢' if direction == 'BUY' else '🔴'} {symbol} | {direction}\n"
+        f"{mitigation_icon}{'🟢' if direction == 'BUY' else '🔴'} {symbol} | {direction}\n"
         f"Timeframe: {tf}\n"
         f"Entry: {entry}\n"
         f"SL: {sl}\n"
@@ -94,8 +100,7 @@ def save_trade(data, msg_id):
     conn.close()
 
 def is_duplicate_signal(data):
-    ist = pytz.timezone("Asia/Kolkata")
-    now_ist = datetime.now(ist)
+    now_ist = datetime.now(IST)
     window_start = now_ist - timedelta(seconds=30)
 
     conn = sqlite3.connect(DB_FILE)
@@ -127,8 +132,11 @@ def receive_signal():
     except Exception as e:
         return jsonify({"status": "error", "error": f"Invalid JSON: {str(e)}"}), 400
 
+    # Override note only if "{{note}}", else keep as is (to detect Mitigation notes)
     data['note'] = "Mr.CopriderBot Signal" if data.get('note') == "{{note}}" else data.get('note', '')
-    data['timestamp'] = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+    # Use provided timestamp if present, else current UTC time
+    if not data.get('timestamp'):
+        data['timestamp'] = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
 
     if is_duplicate_signal(data):
         return jsonify({"status": "duplicate_ignored"})
