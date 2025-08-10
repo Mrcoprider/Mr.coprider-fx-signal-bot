@@ -1,7 +1,7 @@
 from flask import Flask, request, jsonify
 import sqlite3
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime
 import pytz
 import os
 
@@ -9,7 +9,7 @@ app = Flask(__name__)
 
 # === CONFIG ===
 BOT_TOKEN = "7542580180:AAFTa-QVS344MgPlsnvkYRZeenZ-RINvOoc"
-CHAT_IDS = ["-1002507284584", "-1002736244537"]  # multiple Telegram groups
+CHAT_IDS = ["-1002507284584", "-1002736244537"]  # both groups
 DB_FILE = "signals.db"
 IST = pytz.timezone("Asia/Kolkata")
 
@@ -55,12 +55,9 @@ def format_message(data):
     )
 
 def send_telegram(msg):
-    """Send message to all configured Telegram groups with debug logging."""
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    last_msg_id = None
-
     for chat_id in CHAT_IDS:
-        print(f"📤 Attempting to send to group {chat_id} ...")
+        print(f"📤 Attempting to send to {chat_id} ...")
         try:
             payload = {
                 "chat_id": chat_id,
@@ -68,19 +65,9 @@ def send_telegram(msg):
                 "parse_mode": "Markdown"
             }
             response = requests.post(url, json=payload)
-            resp_json = response.json()
-            print(f"🔍 Response from {chat_id}: {resp_json}")
-
-            if not resp_json.get("ok"):
-                print(f"❌ Failed to send to {chat_id}")
-            else:
-                print(f"✅ Successfully sent to {chat_id}")
-                last_msg_id = resp_json.get("result", {}).get("message_id", None)
-
+            print(f"🔍 Response from {chat_id}: {response.text}")
         except Exception as e:
             print(f"⚠️ Error sending to {chat_id}: {e}")
-
-    return last_msg_id
 
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -101,51 +88,40 @@ def init_db():
     conn.commit()
     conn.close()
 
-def save_trade(data, msg_id):
+def save_trade(data):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute(
-        "INSERT INTO trades (symbol, direction, entry, sl, tp, timeframe, note, timestamp, telegram_msg_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO trades (symbol, direction, entry, sl, tp, timeframe, note, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (
             data['symbol'], data['direction'], data['entry'],
             data['sl'], data['tp'], data['timeframe'],
-            data['note'], data['timestamp'], msg_id
+            data['note'], data['timestamp']
         )
     )
     conn.commit()
     conn.close()
 
-def is_duplicate_signal(data):
-    now_ist = datetime.now(IST)
-    window_start = now_ist - timedelta(seconds=30)
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("""
-        SELECT COUNT(*) FROM trades
-        WHERE symbol=? AND direction=? AND entry=? AND sl=? AND tp=? AND timeframe=? AND timestamp > ?
-    """, (
-        data['symbol'], data['direction'], data['entry'],
-        data['sl'], data['tp'], data['timeframe'],
-        window_start.strftime('%Y-%m-%d %H:%M:%S')
-    ))
-    count = c.fetchone()[0]
-    conn.close()
-    return count > 0
-
 @app.route('/', methods=['POST'])
 def receive_signal():
-    data = request.json
-    data['note'] = "Mr.CopriderBot Signal" if data['note'] == "{{note}}" else data['note']
-    data['timestamp'] = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+    print("📥 Webhook received:", request.data)  # Log raw data
 
-    if is_duplicate_signal(data):
-        print("⚠️ Duplicate signal ignored.")
-        return jsonify({"status": "duplicate_ignored"})
+    try:
+        data = request.json
+        data['note'] = "Mr.CopriderBot Signal" if data['note'] == "{{note}}" else data['note']
+        data['timestamp'] = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
 
-    msg = format_message(data)
-    msg_id = send_telegram(msg)
-    save_trade(data, msg_id)
-    return jsonify({"status": "received", "msg_id": msg_id})
+        # Bypass duplicate filtering for testing
+        print("✅ Bypassing duplicate filter for debug mode")
+
+        msg = format_message(data)
+        send_telegram(msg)
+        save_trade(data)
+
+        return jsonify({"status": "received"})
+    except Exception as e:
+        print(f"❌ Error processing webhook: {e}")
+        return jsonify({"status": "error", "error": str(e)}), 400
 
 if __name__ == "__main__":
     init_db()
