@@ -1,7 +1,7 @@
 from flask import Flask, request, jsonify
 import sqlite3
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 import os
 
@@ -9,7 +9,8 @@ app = Flask(__name__)
 
 # === CONFIG ===
 BOT_TOKEN = "7542580180:AAFTa-QVS344MgPlsnvkYRZeenZ-RINvOoc"
-CHAT_IDS = ["-1002507284584", "-1002736244537"]  # both groups
+CHAT_ID_1 = "-1002507284584"       # First group
+CHAT_ID_2 = "-1002736244537"       # Second group
 DB_FILE = "signals.db"
 IST = pytz.timezone("Asia/Kolkata")
 
@@ -25,8 +26,8 @@ def round_price(symbol, price):
 def format_timeframe(tf):
     mapping = {
         "1": "1M", "3": "3M", "5": "5M", "15": "15M", "30": "30M",
-        "60": "H1", "120": "H2", "240": "H4",
-        "D": "Daily", "W": "Weekly", "M": "Monthly"
+        "60": "H1", "120": "H2", "240": "H4", "D": "Daily",
+        "W": "Weekly", "M": "Monthly"
     }
     return mapping.get(tf, tf)
 
@@ -54,20 +55,16 @@ def format_message(data):
         f"📝 {note}"
     )
 
-def send_telegram(msg):
+def send_telegram(chat_id, msg):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    for chat_id in CHAT_IDS:
-        print(f"📤 Attempting to send to {chat_id} ...")
-        try:
-            payload = {
-                "chat_id": chat_id,
-                "text": msg,
-                "parse_mode": "Markdown"
-            }
-            response = requests.post(url, json=payload)
-            print(f"🔍 Response from {chat_id}: {response.text}")
-        except Exception as e:
-            print(f"⚠️ Error sending to {chat_id}: {e}")
+    payload = {
+        "chat_id": chat_id,
+        "text": msg,
+        "parse_mode": "Markdown"
+    }
+    response = requests.post(url, json=payload)
+    print(f"📤 Sent to {chat_id}: {response.json()}")
+    return response.json().get("result", {}).get("message_id", None)
 
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -88,42 +85,64 @@ def init_db():
     conn.commit()
     conn.close()
 
-def save_trade(data):
+def save_trade(data, msg_id):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute(
-        "INSERT INTO trades (symbol, direction, entry, sl, tp, timeframe, note, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (
-            data['symbol'], data['direction'], data['entry'],
-            data['sl'], data['tp'], data['timeframe'],
-            data['note'], data['timestamp']
-        )
-    )
+    c.execute("INSERT INTO trades (symbol, direction, entry, sl, tp, timeframe, note, timestamp, telegram_msg_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (
+        data['symbol'], data['direction'], data['entry'],
+        data['sl'], data['tp'], data['timeframe'],
+        data['note'], data['timestamp'], msg_id
+    ))
     conn.commit()
     conn.close()
 
+def is_duplicate_signal(data):
+    ist = pytz.timezone("Asia/Kolkata")
+    now_ist = datetime.now(ist)
+    window_start = now_ist - timedelta(seconds=30)
+
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("""
+        SELECT COUNT(*) FROM trades
+        WHERE symbol=? AND direction=? AND entry=? AND sl=? AND tp=? AND timeframe=? AND timestamp > ?
+    """, (
+        data['symbol'], data['direction'], data['entry'],
+        data['sl'], data['tp'], data['timeframe'],
+        window_start.strftime('%Y-%m-%d %H:%M:%S')
+    ))
+    count = c.fetchone()[0]
+    conn.close()
+    return count > 0
+
+# === MULTI-ROUTE WEBHOOK ===
 @app.route('/', methods=['POST'])
+@app.route('/webhook', methods=['POST'])
+@app.route('/webhook/', methods=['POST'])
 def receive_signal():
-    print("📥 Webhook received:", request.data)  # Log raw data
+    print("📥 Webhook received:", request.data)  # Debug log
 
-    try:
-        data = request.json
-        data['note'] = "Mr.CopriderBot Signal" if data['note'] == "{{note}}" else data['note']
-        data['timestamp'] = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+    data = request.json
+    if not data:
+        return jsonify({"status": "error", "reason": "No JSON payload"})
 
-        # Bypass duplicate filtering for testing
-        print("✅ Bypassing duplicate filter for debug mode")
+    data['note'] = "Mr.CopriderBot Signal" if data['note'] == "{{note}}" else data['note']
+    data['timestamp'] = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
 
-        msg = format_message(data)
-        send_telegram(msg)
-        save_trade(data)
+    if is_duplicate_signal(data):
+        print("⚠️ Duplicate signal ignored.")
+        return jsonify({"status": "duplicate_ignored"})
 
-        return jsonify({"status": "received"})
-    except Exception as e:
-        print(f"❌ Error processing webhook: {e}")
-        return jsonify({"status": "error", "error": str(e)}), 400
+    msg = format_message(data)
+
+    # Send to both groups
+    msg_id_1 = send_telegram(CHAT_ID_1, msg)
+    send_telegram(CHAT_ID_2, msg)
+
+    save_trade(data, msg_id_1)
+    return jsonify({"status": "received", "msg_id": msg_id_1})
 
 if __name__ == "__main__":
-    init_db()
     port = int(os.environ.get("PORT", 5000))
+    init_db()
     app.run(host="0.0.0.0", port=port, debug=False)
