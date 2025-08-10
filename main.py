@@ -9,7 +9,7 @@ app = Flask(__name__)
 
 # === CONFIG ===
 BOT_TOKEN = "7542580180:AAFTa-QVS344MgPlsnvkYRZeenZ-RINvOoc"
-CHAT_IDS = ["-1002507284584", "-1002736244537"]  # multiple group IDs here
+CHAT_IDS = ["-1002507284584", "-1002736244537"]  # multiple Telegram groups
 DB_FILE = "signals.db"
 IST = pytz.timezone("Asia/Kolkata")
 
@@ -23,8 +23,11 @@ def round_price(symbol, price):
         return round(price, 4)
 
 def format_timeframe(tf):
-    mapping = {"1": "1M", "3": "3M", "5": "5M", "15": "15M", "30": "30M", "60": "H1", "120": "H2",
-               "240": "H4", "D": "Daily", "W": "Weekly", "M": "Monthly"}
+    mapping = {
+        "1": "1M", "3": "3M", "5": "5M", "15": "15M", "30": "30M",
+        "60": "H1", "120": "H2", "240": "H4",
+        "D": "Daily", "W": "Weekly", "M": "Monthly"
+    }
     return mapping.get(tf, tf)
 
 def convert_to_ist(utc_str):
@@ -52,17 +55,31 @@ def format_message(data):
     )
 
 def send_telegram(msg):
+    """Send message to all configured Telegram groups with debug logging."""
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     last_msg_id = None
+
     for chat_id in CHAT_IDS:
-        payload = {
-            "chat_id": chat_id,
-            "text": msg,
-            "parse_mode": "Markdown"
-        }
-        response = requests.post(url, json=payload)
-        print(f"Sent to {chat_id}: {response.text}")  # Debug log
-        last_msg_id = response.json().get("result", {}).get("message_id", None)
+        print(f"📤 Attempting to send to group {chat_id} ...")
+        try:
+            payload = {
+                "chat_id": chat_id,
+                "text": msg,
+                "parse_mode": "Markdown"
+            }
+            response = requests.post(url, json=payload)
+            resp_json = response.json()
+            print(f"🔍 Response from {chat_id}: {resp_json}")
+
+            if not resp_json.get("ok"):
+                print(f"❌ Failed to send to {chat_id}")
+            else:
+                print(f"✅ Successfully sent to {chat_id}")
+                last_msg_id = resp_json.get("result", {}).get("message_id", None)
+
+        except Exception as e:
+            print(f"⚠️ Error sending to {chat_id}: {e}")
+
     return last_msg_id
 
 def init_db():
@@ -87,11 +104,14 @@ def init_db():
 def save_trade(data, msg_id):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("INSERT INTO trades (symbol, direction, entry, sl, tp, timeframe, note, timestamp, telegram_msg_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (
-        data['symbol'], data['direction'], data['entry'],
-        data['sl'], data['tp'], data['timeframe'],
-        data['note'], data['timestamp'], msg_id
-    ))
+    c.execute(
+        "INSERT INTO trades (symbol, direction, entry, sl, tp, timeframe, note, timestamp, telegram_msg_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            data['symbol'], data['direction'], data['entry'],
+            data['sl'], data['tp'], data['timeframe'],
+            data['note'], data['timestamp'], msg_id
+        )
+    )
     conn.commit()
     conn.close()
 
@@ -119,6 +139,7 @@ def receive_signal():
     data['timestamp'] = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
 
     if is_duplicate_signal(data):
+        print("⚠️ Duplicate signal ignored.")
         return jsonify({"status": "duplicate_ignored"})
 
     msg = format_message(data)
